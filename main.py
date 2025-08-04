@@ -833,9 +833,7 @@ async def niko(ctx):
 
 
 # Startup
-from dotenv import load_dotenv
 
-load_dotenv()
 
 token = os.getenv("BOT_TOKEN")
 if not token:
