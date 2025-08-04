@@ -1,10 +1,9 @@
 import discord
 from discord.ext import commands
 import re
-import os
 import json
 import asyncio
-
+import os
 
 LOG_CHANNEL_ID = None
 LOG_FILE = "log_channel.json"
@@ -444,7 +443,7 @@ async def helpme(ctx):
                     value="Sets where the variable caps for a-d respectively.",
                     inline=False)
 
-    embed.add_field(name="🔹 !viewcap",
+    embed.add_field(name="🔹 !viewcaps",
                     value="Displays current caps",
                     inline=False)
 
@@ -519,11 +518,14 @@ async def clear(ctx, player: str):
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
-        return await ctx.send("🚫 You do not have permission to use this command.")
+        return await ctx.send(
+            "🚫 You do not have permission to use this command.")
     elif isinstance(error, commands.MissingRequiredArgument):
         return await ctx.send("❌ Missing required argument.")
     elif isinstance(error, commands.CommandOnCooldown):
-        return await ctx.send(f"⏳ `{ctx.command}` is on cooldown. Try again in {round(error.retry_after, 1)}s.")
+        return await ctx.send(
+            f"⏳ `{ctx.command}` is on cooldown. Try again in {round(error.retry_after, 1)}s."
+        )
     elif isinstance(error, commands.BadArgument):
         return await ctx.send("❌ Invalid argument format.")
     elif isinstance(error, commands.CommandNotFound):
@@ -531,7 +533,6 @@ async def on_command_error(ctx, error):
     else:
         print(f"Unhandled error: {error}")
         raise error  # still raise to keep traceback
-
 
 
 @assign.error
@@ -599,10 +600,7 @@ async def note(ctx, player: str, *, message: str = None):
 
     await ctx.send(f"📝 Note added to {player}: “{trimmed}”")
     await log_admin_action(
-        ctx, f"📝 `{ctx.author}` added note to `{player}`: {trimmed}"
-    )
-
-
+        ctx, f"📝 `{ctx.author}` added note to `{player}`: {trimmed}")
 
 
 @bot.command()
@@ -713,8 +711,6 @@ async def importdata(ctx):
         print(f"Import error: {e}")
 
 
-
-
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def clearnote(ctx, player: str):
@@ -817,24 +813,21 @@ async def viewcaps(ctx):
     limits = load_limits()
     formatted = "\n".join(f"{k} ∈ [0, {v}]" for k, v in limits.items())
     await ctx.send(f"📐 Current Variable Caps:\n{formatted}")
-    
+
+
 @bot.command()
 async def john(ctx):
     await ctx.send("gotti")
+
 
 @bot.command()
 async def niko(ctx):
     await ctx.send("needs a job")
 
 
-
 # Startup
-token = os.getenv("BOT_TOKEN")
-if not token:
-    raise EnvironmentError("BOT_TOKEN environment variable not set.")
-
-
 from dotenv import load_dotenv
+
 load_dotenv()
 
 token = os.getenv("BOT_TOKEN")
