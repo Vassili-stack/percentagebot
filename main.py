@@ -5,6 +5,13 @@ import json
 import asyncio
 import os
 
+BASE_PATH = "/data" if os.getenv("FLY_APP_NAME") else "."
+
+LOG_FILE = os.path.join(BASE_PATH, "log_channel.json")
+LIMITS_FILE = os.path.join(BASE_PATH, "limits.json")
+DATA_FILE = os.path.join(BASE_PATH, "assignments.json")
+
+
 LOG_CHANNEL_ID = None
 LOG_FILE = "log_channel.json"
 if os.path.exists(LOG_FILE):
