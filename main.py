@@ -20,6 +20,9 @@ LOG_FILE = os.path.join(BASE_PATH, "log_channel.json")
 LIMITS_FILE = os.path.join(BASE_PATH, "limits.json")
 DATA_FILE = os.path.join(BASE_PATH, "assignments.json")
 BACKUP_FILE = os.path.join(BASE_PATH, "backup.json")
+PERMISSIONS_FILE = os.path.join(BASE_PATH, "permissions.json")
+
+
 
 def safe_load_json(path, default):
     try:
@@ -28,13 +31,37 @@ def safe_load_json(path, default):
     except (FileNotFoundError, json.JSONDecodeError):
         return default
 
+if not os.path.exists(PERMISSIONS_FILE):
+    with open(PERMISSIONS_FILE, "w") as f:
+        json.dump({"admin_roles": []}, f, indent=2)
+
+def safe_write_json(path, data):
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+    except IOError as e:
+        print(f"[WRITE ERROR] Failed to write {path}: {e}")
+def is_authorized(ctx):
+    perms = safe_load_json(PERMISSIONS_FILE, {"admin_roles": []})
+    admin_roles = [r.lower() for r in perms.get("admin_roles", [])]
+    return any(role.name.lower() in admin_roles for role in ctx.author.roles)
 
 
 log_data = safe_load_json(LOG_FILE, {})
+
+
+
+
+
 LOG_CHANNEL_ID = log_data.get("id")
 
 
 YOUR_DEV_IDS = [670782330352435201]  #Your Discord ID
+
+# Admin Commands
+
+
+
 
 # Intents and bot setup
 intents = discord.Intents.default()
@@ -949,11 +976,15 @@ async def list(ctx):
     per_page = 10
     pages = []
 
+    # Compute average score
+    valid_scores = [v["percent"] for v in player_assignments.values() if "percent" in v]
+    avg_score = sum(valid_scores) / len(valid_scores) if valid_scores else 0
+
     for start in range(0, len(players), per_page):
         chunk = players[start:start + per_page]
         formatted = "\n".join(f"{i + 1}. {p.title()}" for i, p in enumerate(chunk, start=start))
         embed = discord.Embed(
-            title="🧾 Player List",
+            title=f"🧾 Player List • Avg: {avg_score:.2f}%",
             description=formatted,
             color=discord.Color.blue()
         )
@@ -1065,6 +1096,38 @@ async def viewcaps(ctx):
 
 
 
+
+@bot.command()
+async def find(ctx, *, partial: str = None):
+    if not partial or not partial.strip():
+        return await ctx.send("❌ Please provide part of a player's name to search.")
+
+    partial = partial.lower()
+    matches = [p for p in player_assignments.keys() if partial in p]
+
+    if not matches:
+        return await ctx.send(f"🔎 No matches found for `{partial}`.")
+
+    per_page = 10
+    pages = []
+    total = len(matches)
+
+    for start in range(0, total, per_page):
+        chunk = matches[start:start + per_page]
+        formatted = "\n".join(f"{i + 1}. {p.title()}" for i, p in enumerate(chunk, start=start))
+        embed = discord.Embed(
+            title=f"🔍 Results for '{partial}'",
+            description=formatted,
+            color=discord.Color.teal()
+        )
+        embed.set_footer(text=f"Page {start // per_page + 1} of {((total - 1) // per_page) + 1}")
+        pages.append(embed)
+
+    view = PaginatedView(ctx, pages)
+    view.message = await ctx.send(embed=pages[0], view=view)
+
+
+
 @bot.command()
 async def john(ctx):
     await ctx.send("gotti")
@@ -1074,6 +1137,10 @@ async def john(ctx):
 async def niko(ctx):
     await ctx.send("needs a job")
 
+
+@bot.command()
+async def kris(ctx):
+    await ctx.send("dosent know ball")
 
 # Startup
 
