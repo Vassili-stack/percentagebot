@@ -15,6 +15,8 @@ import os
 
 # Paths for data files
 BASE_PATH = "/data" if os.getenv("FLY_APP_NAME") else "."
+if not os.path.exists(BASE_PATH):
+    os.makedirs(BASE_PATH, exist_ok=True)
 
 LOG_FILE = os.path.join(BASE_PATH, "log_channel.json")
 LIMITS_FILE = os.path.join(BASE_PATH, "limits.json")
