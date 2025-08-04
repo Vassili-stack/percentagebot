@@ -675,12 +675,23 @@ async def assign_error(ctx, error):
 @commands.has_permissions(administrator=True)
 async def exportdata(ctx):
     try:
+        export_payload = {
+            "__meta__": {
+                "limits": limits,
+                "exported_by": str(ctx.author),
+                "timestamp": discord.utils.format_dt(discord.utils.utcnow(), style='F')
+            },
+            **player_assignments
+        }
+
         with open(BACKUP_FILE, "w") as f:
-            json.dump(player_assignments, f, indent=2)
+            json.dump(export_payload, f, indent=2)
+
         await ctx.send(file=discord.File(BACKUP_FILE))
     except Exception as e:
         await ctx.send("❌ Failed to export backup.")
         print(f"Export error: {e}")
+
 
 
 @bot.command()
@@ -849,11 +860,41 @@ async def importdata(ctx):
         if not isinstance(raw_data, dict):
             return await ctx.send("❌ Backup file format is invalid. Expected a dictionary.")
 
-        required_keys = {"percent", "a", "b", "c", "d", "note"}
-        valid_data = {
-            k: v for k, v in raw_data.items()
-            if isinstance(v, dict) and required_keys.issubset(v)
-        }
+        # Handle __meta__ data if present
+        meta = raw_data.pop("__meta__", {})
+        imported_limits = meta.get("limits", {})
+        limit_conflicts = []
+
+        for k in ("a", "b", "c", "d"):
+            if k in imported_limits and k in limits:
+                if imported_limits[k] != limits[k]:
+                    limit_conflicts.append(f"{k}: file = {imported_limits[k]}, current = {limits[k]}")
+
+        # Optionally update your live limits from imported ones
+        # limits.update(imported_limits)  # ← uncomment this if you want import to override live caps
+
+        required_keys = {"percent", "a", "b", "c", "d"}
+        valid_data = {}
+        violations = []
+
+        for player, v in raw_data.items():
+            if not isinstance(v, dict) or not required_keys.issubset(v):
+                continue
+
+            entry = {key: v[key] for key in required_keys}
+
+            if "note" in v:
+                entry["note"] = v["note"]
+            if "comment" in v:
+                entry["comment"] = v["comment"]
+
+            # Check for range violations
+            for key in ("a", "b", "c", "d"):
+                if key in entry and key in limits:
+                    if not (0 <= entry[key] <= limits[key]):
+                        violations.append(f"🔸 `{player}`: `{key}` = {entry[key]} > cap {limits[key]}")
+
+            valid_data[player] = entry
 
         if not valid_data:
             return await ctx.send("❌ No valid player entries found in the uploaded file.")
@@ -862,7 +903,16 @@ async def importdata(ctx):
         player_assignments.update(valid_data)
         save_data()
 
-        await ctx.send(f"📥 Successfully imported {len(valid_data)} players from file.")
+        msg = f"📥 Imported `{len(valid_data)}` players from `{attachment.filename}`."
+        if limit_conflicts:
+            msg += "\n⚠️ Limit discrepancies with file caps:\n" + "\n".join(limit_conflicts)
+        if violations:
+            summary = "\n".join(violations[:10])
+            if len(violations) > 10:
+                summary += f"\n...and {len(violations) - 10} more."
+            msg += f"\n⚠️ Value overages vs current caps:\n{summary}"
+
+        await ctx.send(msg)
         await log_admin_action(ctx, f"📥 Imported {len(valid_data)} players from `{attachment.filename}`.")
 
     except asyncio.TimeoutError:
@@ -872,6 +922,7 @@ async def importdata(ctx):
     except Exception as e:
         await ctx.send("❌ An unexpected error occurred during import.")
         print(f"[IMPORT ERROR] {e}")
+
 
 @bot.command()
 @commands.has_permissions(administrator=True)
