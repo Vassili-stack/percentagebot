@@ -1,8 +1,3 @@
-# fly.toml app configuration file generated for percentagebot on 2025-08-04T06:11:45Z
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
-
 app = "percentagebot"
 primary_region = "sea"
 
@@ -10,6 +5,12 @@ primary_region = "sea"
 
 [processes]
 bot = "python main.py"
+
+[http_service]
+internal_port = 8080
+auto_stop_machines = false
+auto_start_machines = true
+processes = ["bot"]
 
 [[vm]]
 memory = "256mb"
