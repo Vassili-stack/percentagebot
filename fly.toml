@@ -1,4 +1,4 @@
-# fly.toml app configuration file generated for percentagebot on 2025-08-04T05:42:29Z
+# fly.toml app configuration file generated for percentagebot on 2025-08-04T06:05:15Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
@@ -15,10 +15,6 @@ primary_region = 'sea'
   auto_start_machines = true
   min_machines_running = 0
   processes = ['app']
-
-[mounts]
-source = "data_volume"
-destination = "/data"
 
 [[vm]]
   memory = '1gb'
