@@ -12,6 +12,10 @@ auto_stop_machines = false
 auto_start_machines = true
 processes = ["bot"]
 
+[mounts]
+  source = "datavol"
+  destination = "/data"
+
 [[vm]]
 memory = "256mb"
 cpu_kind = "shared"
