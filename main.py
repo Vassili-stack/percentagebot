@@ -823,9 +823,15 @@ async def log_admin_action(ctx, action: str):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def importdata(ctx):
-    file_name = os.path.basename(BACKUP_FILE)
+    if not ctx.message.attachments:
+        return await ctx.send("❌ Please attach a `.json` file containing the backup data.")
+
+    attachment = ctx.message.attachments[0]
+    if not attachment.filename.endswith(".json"):
+        return await ctx.send("❌ The attached file must be a `.json` file.")
+
     await ctx.send(
-        f"⚠️ This will **overwrite** all current player data with data from `{file_name}`.\n"
+        f"⚠️ This will **overwrite** all current player data with the contents of `{attachment.filename}`.\n"
         "Type `CONFIRM` to proceed or `CANCEL` to abort."
     )
 
@@ -837,12 +843,11 @@ async def importdata(ctx):
         if reply.content.strip().upper() != "CONFIRM":
             return await ctx.send("❌ Import operation canceled.")
 
-        raw_data = safe_load_json(BACKUP_FILE, "__INVALID__")
-        if raw_data == "__INVALID__":
-            return await ctx.send(f"❌ Failed to load `{file_name}` (missing or corrupt).")
+        file_bytes = await attachment.read()
+        raw_data = json.loads(file_bytes.decode("utf-8"))
 
         if not isinstance(raw_data, dict):
-            return await ctx.send(f"❌ Backup file format is invalid. Expected a dictionary.")
+            return await ctx.send("❌ Backup file format is invalid. Expected a dictionary.")
 
         required_keys = {"percent", "a", "b", "c", "d", "note"}
         valid_data = {
@@ -851,23 +856,22 @@ async def importdata(ctx):
         }
 
         if not valid_data:
-            return await ctx.send("❌ No valid player entries found in backup.")
+            return await ctx.send("❌ No valid player entries found in the uploaded file.")
 
         player_assignments.clear()
         player_assignments.update(valid_data)
         save_data()
 
-        await ctx.send(f"📥 Successfully imported {len(valid_data)} players from backup.")
-        await log_admin_action(
-            ctx, f"📥 Imported {len(valid_data)} players from `{file_name}`."
-        )
+        await ctx.send(f"📥 Successfully imported {len(valid_data)} players from file.")
+        await log_admin_action(ctx, f"📥 Imported {len(valid_data)} players from `{attachment.filename}`.")
 
     except asyncio.TimeoutError:
         await ctx.send("⏳ Timed out. Import canceled.")
+    except json.JSONDecodeError:
+        await ctx.send("❌ The attached file is not valid JSON.")
     except Exception as e:
         await ctx.send("❌ An unexpected error occurred during import.")
         print(f"[IMPORT ERROR] {e}")
-
 
 @bot.command()
 @commands.has_permissions(administrator=True)
