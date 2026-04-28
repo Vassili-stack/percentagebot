@@ -1,177 +1,28 @@
+from __future__ import annotations
+
 import asyncio
-import json
 import os
-import re
-import uuid
+import secrets
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any
 
 import discord
 from discord.ext import commands
 
-from ocr_parser import parse_battlegroup_image
-
-# ---------- Paths / persistent files ----------
-
-BASE_PATH = "/data" if os.getenv("FLY_APP_NAME") else "."
-os.makedirs(BASE_PATH, exist_ok=True)
-
-DATA_FILE = os.path.join(BASE_PATH, "reservations.json")
-CONFIG_FILE = os.path.join(BASE_PATH, "config.json")
-BACKUP_FILE = os.path.join(BASE_PATH, "backup.json")
-
-DEFAULT_DATA = {"battlegroups": {}}
-DEFAULT_CONFIG = {"log_channel_id": None, "scan_channel_id": None}
-
-# Pending scans are intentionally in-memory. If the bot restarts, re-upload the screenshot.
-pending_scans: Dict[str, dict] = {}
-
-
-# ---------- JSON helpers ----------
-
-def safe_load_json(path: str, default: dict) -> dict:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return default.copy()
-
-
-def safe_write_json(path: str, data: dict) -> None:
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    os.replace(tmp_path, path)
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def canonical_name(name: str) -> str:
-    return re.sub(r"\s+", " ", name.strip()).casefold()
-
-
-def load_data() -> dict:
-    data = safe_load_json(DATA_FILE, DEFAULT_DATA)
-    if "battlegroups" not in data or not isinstance(data["battlegroups"], dict):
-        data = DEFAULT_DATA.copy()
-    return data
-
-
-def save_data(data: dict) -> None:
-    safe_write_json(DATA_FILE, data)
-
-
-def load_config() -> dict:
-    config = safe_load_json(CONFIG_FILE, DEFAULT_CONFIG)
-    for key, value in DEFAULT_CONFIG.items():
-        config.setdefault(key, value)
-    return config
-
-
-def save_config(config: dict) -> None:
-    safe_write_json(CONFIG_FILE, config)
-
-
-# ---------- Data operations ----------
-
-def ensure_bg(data: dict, bg: int) -> dict:
-    bg_key = str(bg)
-    groups = data.setdefault("battlegroups", {})
-    group = groups.setdefault(bg_key, {"reserved": {}})
-    group.setdefault("reserved", {})
-    return group
-
-
-def add_reserved_players(
-    *,
-    bg: int,
-    names: List[str],
-    source_message_id: int,
-    image_url: str,
-    detected_by: str,
-    replace: bool = False,
-) -> int:
-    data = load_data()
-    group = ensure_bg(data, bg)
-
-    if replace:
-        group["reserved"] = {}
-
-    added_or_updated = 0
-    for name in names:
-        cleaned = re.sub(r"\s+", " ", name).strip()
-        if not cleaned:
-            continue
-
-        key = canonical_name(cleaned)
-        group["reserved"][key] = {
-            "name": cleaned,
-            "last_seen": utc_now(),
-            "source_message_id": str(source_message_id),
-            "image_url": image_url,
-            "detected_by": detected_by,
-        }
-        added_or_updated += 1
-
-    save_data(data)
-    return added_or_updated
-
-
-def remove_player_everywhere(player: str) -> int:
-    data = load_data()
-    target = canonical_name(player)
-    removed = 0
-
-    for group in data.get("battlegroups", {}).values():
-        reserved = group.get("reserved", {})
-        if target in reserved:
-            del reserved[target]
-            removed += 1
-
-    save_data(data)
-    return removed
-
-
-def rename_player_everywhere(old: str, new: str) -> int:
-    data = load_data()
-    old_key = canonical_name(old)
-    new_clean = re.sub(r"\s+", " ", new).strip()
-    new_key = canonical_name(new_clean)
-    renamed = 0
-
-    for group in data.get("battlegroups", {}).values():
-        reserved = group.get("reserved", {})
-        if old_key in reserved:
-            record = reserved.pop(old_key)
-            record["name"] = new_clean
-            record["renamed_at"] = utc_now()
-            reserved[new_key] = record
-            renamed += 1
-
-    save_data(data)
-    return renamed
-
-
-def get_bg_reserved(bg: int) -> List[str]:
-    data = load_data()
-    group = data.get("battlegroups", {}).get(str(bg), {})
-    records = group.get("reserved", {})
-    names = [v.get("name", k) for k, v in records.items()]
-    return sorted(names, key=str.casefold)
-
-
-def all_reserved_by_bg() -> Dict[str, List[str]]:
-    data = load_data()
-    result = {}
-    for bg, group in data.get("battlegroups", {}).items():
-        records = group.get("reserved", {})
-        result[bg] = sorted([v.get("name", k) for k, v in records.items()], key=str.casefold)
-    return dict(sorted(result.items(), key=lambda item: int(item[0]) if item[0].isdigit() else item[0]))
-
-
-# ---------- Discord setup ----------
+from ocr_parser import parse_battlegroup_screenshot
+from storage import (
+    CONFIG_PATH,
+    RESERVATIONS_PATH,
+    load_config,
+    load_reservations,
+    merge_bg_reservations,
+    remove_player,
+    rename_player,
+    save_config,
+    save_reservations,
+    wipe_all,
+)
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
@@ -182,50 +33,91 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
+# Pending scans live in memory. Confirm soon after scanning.
+PENDING_SCANS: dict[str, dict[str, Any]] = {}
 
-async def log_admin_action(ctx_or_message, action: str) -> None:
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def is_image_attachment(att: discord.Attachment) -> bool:
+    if att.content_type and att.content_type.startswith("image/"):
+        return True
+    return Path(att.filename.lower()).suffix in IMAGE_EXTS
+
+
+async def get_scan_attachments(ctx: commands.Context) -> list[discord.Attachment]:
+    attachments = [att for att in ctx.message.attachments if is_image_attachment(att)]
+    if attachments:
+        return attachments
+
+    if ctx.message.reference and ctx.message.reference.resolved:
+        ref = ctx.message.reference.resolved
+        if isinstance(ref, discord.Message):
+            return [att for att in ref.attachments if is_image_attachment(att)]
+
+    return []
+
+
+async def log_action(guild: discord.Guild | None, message: str) -> None:
+    if guild is None:
+        return
+
     config = load_config()
     channel_id = config.get("log_channel_id")
     if not channel_id:
         return
 
-    try:
-        channel = await bot.fetch_channel(int(channel_id))
-        author = getattr(ctx_or_message, "author", None)
-        if hasattr(ctx_or_message, "message"):
-            author = ctx_or_message.message.author
-        author_text = str(author) if author else "Unknown"
-        await channel.send(f"`{utc_now()}` **{author_text}** — {action}")
-    except Exception as e:
-        print(f"[LOG ERROR] {e}")
+    channel = guild.get_channel(int(channel_id))
+    if isinstance(channel, discord.TextChannel):
+        try:
+            await channel.send(message)
+        except discord.HTTPException:
+            pass
 
 
-def attachment_is_image(attachment: discord.Attachment) -> bool:
-    if attachment.content_type and attachment.content_type.startswith("image/"):
+def scan_channel_allowed(ctx: commands.Context) -> bool:
+    config = load_config()
+    channel_id = config.get("scan_channel_id")
+    if not channel_id:
         return True
-    return attachment.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+    return int(channel_id) == ctx.channel.id
 
 
-def build_scan_message(scan_id: str, parsed: dict) -> str:
-    bg = parsed.get("battlegroup")
-    reserved = parsed.get("reserved", [])
-    raw_header = parsed.get("raw_header", "")
+def format_scan_result(scan_id: str, result: dict[str, Any], debug: bool = False) -> str:
+    bg = result.get("battlegroup")
+    names = result.get("reserved", [])
 
     lines = [
         f"Scan ID: {scan_id}",
-        f"Battlegroup: {bg if bg is not None else 'NOT FOUND'}",
+        f"Battlegroup: {bg if bg is not None else 'not detected'}",
         "",
         "Reserved detected:",
     ]
 
-    if reserved:
-        lines.extend(f"- {name}" for name in reserved)
+    if names:
+        lines.extend(f"- {name}" for name in names)
     else:
         lines.append("- None detected")
 
     lines.extend([
         "",
-        f"Header OCR: {raw_header or '(blank)'}",
+        f"Header OCR: {result.get('header_ocr', '').strip() or '[empty]'}",
+    ])
+
+    if debug or not names:
+        row_lines = result.get("row_ocr_lines", [])
+        lines.append("")
+        lines.append("Row OCR lines:")
+        if row_lines:
+            lines.extend(f"- {line}" for line in row_lines[:20])
+        else:
+            lines.append("- [empty]")
+
+    lines.extend([
         "",
         f"Save: !confirm {scan_id}",
         f"Save and replace that BG: !confirm {scan_id} replace",
@@ -235,196 +127,112 @@ def build_scan_message(scan_id: str, parsed: dict) -> str:
     return "```txt\n" + "\n".join(lines) + "\n```"
 
 
-async def parse_attachment_to_pending(message: discord.Message, attachment: discord.Attachment) -> Optional[Tuple[str, dict]]:
-    if not attachment_is_image(attachment):
-        return None
-
-    image_bytes = await attachment.read()
-    parsed = parse_battlegroup_image(image_bytes)
-
-    scan_id = uuid.uuid4().hex[:6].upper()
-    pending_scans[scan_id] = {
-        "parsed": parsed,
-        "message_id": message.id,
-        "channel_id": message.channel.id,
-        "image_url": attachment.url,
-        "created_by": str(message.author),
-        "created_at": utc_now(),
-    }
-
-    return scan_id, parsed
-
-
-# ---------- Events ----------
-
 @bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}")
+async def on_ready() -> None:
+    print(f"Logged in as {bot.user} ({bot.user.id if bot.user else 'unknown id'})")
 
 
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
+@bot.command(name="scan")
+async def scan(ctx: commands.Context, *args: str) -> None:
+    """Scan an attached/replied screenshot for battlegroup reservations."""
+    if not scan_channel_allowed(ctx):
+        await ctx.reply("Scans are restricted to the configured scan channel.", mention_author=False)
         return
 
-    # Commands get exclusive handling so !scan does not also auto-scan.
-    if message.content.startswith("!"):
-        await bot.process_commands(message)
+    attachments = await get_scan_attachments(ctx)
+    if not attachments:
+        await ctx.reply("Attach an image to `!scan`, or reply to an image with `!scan`.", mention_author=False)
         return
 
-    config = load_config()
-    scan_channel_id = config.get("scan_channel_id")
+    debug = any(arg.lower() == "debug" for arg in args)
 
-    if scan_channel_id and message.channel.id == int(scan_channel_id) and message.attachments:
-        for attachment in message.attachments:
-            try:
-                result = await parse_attachment_to_pending(message, attachment)
-                if result is None:
-                    continue
-                scan_id, parsed = result
-                await message.channel.send(build_scan_message(scan_id, parsed))
-            except Exception as e:
-                await message.channel.send(f"❌ OCR failed on `{attachment.filename}`: `{e}`")
-                print(f"[OCR ERROR] {e}")
-
-
-# ---------- Setup commands ----------
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setlogchannel(ctx, channel_id: int):
-    try:
-        channel = await bot.fetch_channel(channel_id)
-    except discord.NotFound:
-        return await ctx.send("❌ Channel not found.")
-    except discord.Forbidden:
-        return await ctx.send("❌ I cannot access that channel.")
-
-    config = load_config()
-    config["log_channel_id"] = channel.id
-    save_config(config)
-    await ctx.send(f"✅ Log channel set to {channel.mention}.")
-
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setscanchannel(ctx, channel_id: int):
-    try:
-        channel = await bot.fetch_channel(channel_id)
-    except discord.NotFound:
-        return await ctx.send("❌ Channel not found.")
-    except discord.Forbidden:
-        return await ctx.send("❌ I cannot access that channel.")
-
-    config = load_config()
-    config["scan_channel_id"] = channel.id
-    save_config(config)
-    await ctx.send(f"✅ Scan channel set to {channel.mention}. Images posted there will be OCR-scanned.")
-
-
-@bot.command()
-async def viewsetup(ctx):
-    config = load_config()
-    await ctx.send(
-        "```txt\n"
-        f"Log channel: {config.get('log_channel_id')}\n"
-        f"Scan channel: {config.get('scan_channel_id')}\n"
-        "```"
-    )
-
-
-# ---------- OCR commands ----------
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def scan(ctx):
-    """Scan attached image(s), or image(s) from the message being replied to."""
-    target_message = ctx.message
-
-    if not target_message.attachments and ctx.message.reference:
+    for attachment in attachments:
         try:
-            ref = ctx.message.reference
-            target_message = await ctx.channel.fetch_message(ref.message_id)
-        except Exception:
-            return await ctx.send("❌ Could not read the replied-to message.")
+            image_bytes = await attachment.read()
+            result = await asyncio.to_thread(parse_battlegroup_screenshot, image_bytes)
+        except Exception as exc:
+            await ctx.reply(f"OCR failed: `{type(exc).__name__}: {exc}`", mention_author=False)
+            continue
 
-    if not target_message.attachments:
-        return await ctx.send("❌ Attach an image to `!scan`, or reply to an image with `!scan`.")
+        scan_id = secrets.token_hex(3).upper()
+        PENDING_SCANS[scan_id] = {
+            "result": result,
+            "user_id": ctx.author.id,
+            "channel_id": ctx.channel.id,
+            "message_id": ctx.message.id,
+            "attachment": attachment.filename,
+            "created_at": utc_now_iso(),
+        }
 
-    any_scanned = False
-    for attachment in target_message.attachments:
-        try:
-            result = await parse_attachment_to_pending(target_message, attachment)
-            if result is None:
-                continue
-            scan_id, parsed = result
-            any_scanned = True
-            await ctx.send(build_scan_message(scan_id, parsed))
-        except Exception as e:
-            await ctx.send(f"❌ OCR failed on `{attachment.filename}`: `{e}`")
-            print(f"[OCR ERROR] {e}")
-
-    if not any_scanned:
-        await ctx.send("❌ No image attachments found.")
+        await ctx.send(format_scan_result(scan_id, result, debug=debug))
 
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def confirm(ctx, scan_id: str, mode: str = "merge"):
-    scan_id = scan_id.upper().strip()
-    pending = pending_scans.get(scan_id)
+@bot.command(name="confirm")
+async def confirm(ctx: commands.Context, scan_id: str | None = None, mode: str | None = None) -> None:
+    if not scan_id:
+        await ctx.reply("Use `!confirm [scan_id]` or `!confirm [scan_id] replace`.", mention_author=False)
+        return
+
+    scan_id = scan_id.upper()
+    pending = PENDING_SCANS.get(scan_id)
     if not pending:
-        return await ctx.send("❌ Unknown or expired scan ID. Re-scan the image.")
+        await ctx.reply("No pending scan with that ID.", mention_author=False)
+        return
 
-    parsed = pending["parsed"]
-    bg = parsed.get("battlegroup")
-    reserved = parsed.get("reserved", [])
+    result = pending["result"]
+    bg = result.get("battlegroup")
+    names = result.get("reserved", [])
 
     if bg is None:
-        return await ctx.send("❌ Cannot confirm: battlegroup was not detected.")
-    if not reserved:
-        return await ctx.send("❌ Cannot confirm: no reserved players were detected.")
+        await ctx.reply("Cannot save: battlegroup was not detected.", mention_author=False)
+        return
 
-    replace = mode.casefold() == "replace"
-    if mode.casefold() not in {"merge", "replace"}:
-        return await ctx.send("❌ Use `!confirm [scan_id]` or `!confirm [scan_id] replace`.")
+    if not names:
+        await ctx.reply("Cannot save: no reserved players were detected.", mention_author=False)
+        return
 
-    count = add_reserved_players(
-        bg=int(bg),
-        names=reserved,
-        source_message_id=pending["message_id"],
-        image_url=pending["image_url"],
-        detected_by=str(ctx.author),
-        replace=replace,
-    )
+    replace = bool(mode and mode.lower() == "replace")
+    meta = {
+        "confirmed_by": str(ctx.author),
+        "confirmed_at": utc_now_iso(),
+        "source_message_id": str(pending.get("message_id")),
+        "source_attachment": pending.get("attachment"),
+    }
 
-    del pending_scans[scan_id]
-    verb = "replaced" if replace else "merged"
-    await ctx.send(f"✅ Saved BG{bg}: {count} reserved player(s) {verb}.")
-    await log_admin_action(ctx, f"Confirmed OCR scan `{scan_id}` for BG{bg}; {count} player(s) {verb}.")
+    merge_bg_reservations(int(bg), names, replace=replace, meta=meta)
+    del PENDING_SCANS[scan_id]
+
+    action = "replaced" if replace else "saved"
+    await ctx.reply(f"BG{bg} reservations {action}: {', '.join(names)}", mention_author=False)
+    await log_action(ctx.guild, f"`{ctx.author}` confirmed scan `{scan_id}` for BG{bg}: {', '.join(names)}")
 
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def reject(ctx, scan_id: str):
-    scan_id = scan_id.upper().strip()
-    if pending_scans.pop(scan_id, None):
-        await ctx.send(f"🗑️ Rejected scan `{scan_id}`.")
+@bot.command(name="reject")
+async def reject(ctx: commands.Context, scan_id: str | None = None) -> None:
+    if not scan_id:
+        await ctx.reply("Use `!reject [scan_id]`.", mention_author=False)
+        return
+
+    scan_id = scan_id.upper()
+    if PENDING_SCANS.pop(scan_id, None):
+        await ctx.reply(f"Rejected scan `{scan_id}`.", mention_author=False)
     else:
-        await ctx.send("❌ Unknown or expired scan ID.")
+        await ctx.reply("No pending scan with that ID.", mention_author=False)
 
-
-# ---------- Viewing commands ----------
 
 @bot.command(name="list")
-async def list_reserved(ctx):
-    grouped = all_reserved_by_bg()
-    if not any(grouped.values()):
-        return await ctx.send("No reserved players saved yet.")
+async def list_all(ctx: commands.Context) -> None:
+    data = load_reservations()
+    bgs = data.get("battlegroups", {})
 
-    lines = []
-    for bg, names in grouped.items():
-        lines.append(f"BATTLEGROUP {bg}")
+    if not bgs:
+        await ctx.reply("No reservations saved.", mention_author=False)
+        return
+
+    lines: list[str] = []
+    for bg_key in sorted(bgs.keys(), key=lambda value: int(value) if value.isdigit() else value):
+        names = bgs[bg_key].get("reserved", [])
+        lines.append(f"Battlegroup {bg_key}:")
         if names:
             lines.extend(f"- {name}" for name in names)
         else:
@@ -434,177 +242,178 @@ async def list_reserved(ctx):
     await ctx.send("```txt\n" + "\n".join(lines).strip() + "\n```")
 
 
-@bot.command()
-async def viewbg(ctx, bg: int):
-    names = get_bg_reserved(bg)
-    if not names:
-        return await ctx.send(f"No reserved players saved for BG{bg}.")
+@bot.command(name="viewbg")
+async def view_bg(ctx: commands.Context, bg: str | None = None) -> None:
+    if not bg:
+        await ctx.reply("Use `!viewbg [number]`.", mention_author=False)
+        return
 
-    lines = [f"BATTLEGROUP {bg}", ""]
-    lines.extend(f"- {name}" for name in names)
+    data = load_reservations()
+    bg_data = data.get("battlegroups", {}).get(str(bg))
+    if not bg_data:
+        await ctx.reply(f"No saved reservations for BG{bg}.", mention_author=False)
+        return
+
+    names = bg_data.get("reserved", [])
+    lines = [f"Battlegroup {bg}:"]
+    lines.extend(f"- {name}" for name in names) if names else lines.append("- None")
     await ctx.send("```txt\n" + "\n".join(lines) + "\n```")
 
 
-# ---------- Data management commands ----------
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def clear(ctx, *, player: str):
-    removed = remove_player_everywhere(player)
-    if removed == 0:
-        return await ctx.send(f"❌ `{player}` was not found.")
-    await ctx.send(f"✅ Removed `{player}` from {removed} battlegroup(s).")
-    await log_admin_action(ctx, f"Cleared `{player}` from {removed} battlegroup(s).")
-
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def clearbg(ctx, bg: int):
-    data = load_data()
-    group = ensure_bg(data, bg)
-    count = len(group.get("reserved", {}))
-    group["reserved"] = {}
-    save_data(data)
-    await ctx.send(f"✅ Cleared {count} reserved player(s) from BG{bg}.")
-    await log_admin_action(ctx, f"Cleared BG{bg} reserved list.")
-
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def rename(ctx, *, text: str):
-    if "->" not in text:
-        return await ctx.send("❌ Use: `!rename old name -> new name`")
-
-    old, new = [part.strip() for part in text.split("->", 1)]
-    if not old or not new:
-        return await ctx.send("❌ Use: `!rename old name -> new name`")
-
-    count = rename_player_everywhere(old, new)
-    if count == 0:
-        return await ctx.send(f"❌ `{old}` was not found.")
-
-    await ctx.send(f"✅ Renamed `{old}` → `{new}` in {count} battlegroup(s).")
-    await log_admin_action(ctx, f"Renamed `{old}` → `{new}` in {count} battlegroup(s).")
-
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def wipe(ctx):
-    def check(m: discord.Message):
-        return m.author == ctx.author and m.channel == ctx.channel
-
-    await ctx.send("⚠️ This clears ALL saved reserved-player data. Type `CONFIRM` to proceed, or anything else to cancel.")
-    try:
-        reply = await bot.wait_for("message", timeout=20.0, check=check)
-    except asyncio.TimeoutError:
-        return await ctx.send("Timed out. Wipe canceled.")
-
-    if reply.content.strip().upper() != "CONFIRM":
-        return await ctx.send("Wipe canceled.")
-
-    save_data(DEFAULT_DATA.copy())
-    await ctx.send("✅ All reserved-player data wiped.")
-    await log_admin_action(ctx, "Wiped all reserved-player data.")
-
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def exportdata(ctx):
-    data = load_data()
-    payload = {
-        "__meta__": {
-            "exported_at": utc_now(),
-            "exported_by": str(ctx.author),
-            "schema": "reserved-battlegroups-v1",
-        },
-        **data,
-    }
-    safe_write_json(BACKUP_FILE, payload)
-    await ctx.send(file=discord.File(BACKUP_FILE, filename="backup.json"))
-
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def importdata(ctx):
-    if not ctx.message.attachments:
-        return await ctx.send("❌ Attach a JSON backup file to `!importdata`.")
-
-    attachment = ctx.message.attachments[0]
-    if not attachment.filename.lower().endswith(".json"):
-        return await ctx.send("❌ Backup must be a `.json` file.")
-
-    try:
-        raw = await attachment.read()
-        payload = json.loads(raw.decode("utf-8"))
-    except Exception as e:
-        return await ctx.send(f"❌ Could not read JSON: `{e}`")
-
-    if "battlegroups" not in payload:
-        return await ctx.send("❌ Invalid backup: missing `battlegroups`.")
-
-    imported = {"battlegroups": payload["battlegroups"]}
-    save_data(imported)
-    await ctx.send("✅ Imported backup and replaced current data.")
-    await log_admin_action(ctx, "Imported reservation backup.")
-
-
-@bot.command()
-async def helpme(ctx):
-    text = """
-OCR
-!scan
-  Scan attached image(s), or reply to an image with !scan.
-!confirm [scan_id]
-  Save detected reserved players into their battlegroup.
-!confirm [scan_id] replace
-  Replace that battlegroup's saved reserved list with the scan result.
-!reject [scan_id]
-  Reject a pending scan.
-
-Viewing
-!list
-  List all saved reserved players by battlegroup.
-!viewbg [number]
-  View one battlegroup.
-
-Data Management
-!rename old name -> new name
-  Rename a saved player across all battlegroups.
-!clear [player]
-  Remove a player across all battlegroups.
-!clearbg [number]
-  Clear one battlegroup.
-!wipe
-  Clear all saved data after confirmation.
-!exportdata
-  Export current data as backup.json.
-!importdata
-  Import a JSON backup attached to the command.
-
-Setup
-!setscanchannel [channel_id]
-  Set the channel where uploaded images are automatically scanned.
-!setlogchannel [channel_id]
-  Set the admin log channel.
-!viewsetup
-  Show saved setup values.
-""".strip()
-    await ctx.send(f"```txt\n{text}\n```")
-
-
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
-        return await ctx.send("❌ You need administrator permission to use that command.")
-    if isinstance(error, commands.MissingRequiredArgument):
-        return await ctx.send("❌ Missing required argument. Use `!helpme`.")
-    if isinstance(error, commands.BadArgument):
-        return await ctx.send("❌ Invalid argument type. Use `!helpme`.")
-    if isinstance(error, commands.CommandNotFound):
+@bot.command(name="rename")
+async def rename(ctx: commands.Context, old_name: str | None = None, *, new_name: str | None = None) -> None:
+    if not old_name or not new_name:
+        await ctx.reply("Use `!rename [old] [new]`. For names with spaces, quote the old name: `!rename \"old name\" new name`.", mention_author=False)
         return
 
-    print(f"[COMMAND ERROR] {repr(error)}")
-    await ctx.send(f"❌ Error: `{error}`")
+    changed = rename_player(old_name, new_name)
+    await ctx.reply(f"Renamed {changed} matching entr{'y' if changed == 1 else 'ies'}.", mention_author=False)
+    await log_action(ctx.guild, f"`{ctx.author}` renamed `{old_name}` to `{new_name}`")
+
+
+@bot.command(name="clear")
+async def clear(ctx: commands.Context, *, player_name: str | None = None) -> None:
+    if not player_name:
+        await ctx.reply("Use `!clear [player]`.", mention_author=False)
+        return
+
+    removed = remove_player(player_name)
+    await ctx.reply(f"Removed {removed} matching entr{'y' if removed == 1 else 'ies'} for `{player_name}`.", mention_author=False)
+    await log_action(ctx.guild, f"`{ctx.author}` cleared `{player_name}`")
+
+
+@bot.command(name="wipe")
+async def wipe(ctx: commands.Context, confirmation: str | None = None) -> None:
+    if confirmation != "CONFIRM":
+        await ctx.reply("This clears all saved reservations. Use `!wipe CONFIRM`.", mention_author=False)
+        return
+
+    wipe_all()
+    await ctx.reply("All saved reservations wiped.", mention_author=False)
+    await log_action(ctx.guild, f"`{ctx.author}` wiped all reservations")
+
+
+@bot.command(name="exportdata")
+async def export_data(ctx: commands.Context) -> None:
+    if not RESERVATIONS_PATH.exists():
+        save_reservations({"battlegroups": {}})
+    await ctx.reply(file=discord.File(str(RESERVATIONS_PATH), filename="reservations.json"), mention_author=False)
+
+
+@bot.command(name="importdata")
+async def import_data(ctx: commands.Context) -> None:
+    attachments = ctx.message.attachments
+    if not attachments:
+        await ctx.reply("Attach a `reservations.json` file to `!importdata`.", mention_author=False)
+        return
+
+    attachment = attachments[0]
+    try:
+        raw = await attachment.read()
+        import json
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict) or "battlegroups" not in data:
+            raise ValueError("JSON must contain a battlegroups object.")
+        save_reservations(data)
+    except Exception as exc:
+        await ctx.reply(f"Import failed: `{type(exc).__name__}: {exc}`", mention_author=False)
+        return
+
+    await ctx.reply("Imported reservations data.", mention_author=False)
+    await log_action(ctx.guild, f"`{ctx.author}` imported reservations data")
+
+
+@bot.command(name="setscanchannel")
+@commands.has_permissions(manage_guild=True)
+async def set_scan_channel(ctx: commands.Context, channel_id: int | None = None) -> None:
+    if channel_id is None:
+        await ctx.reply("Use `!setscanchannel [channel_id]`.", mention_author=False)
+        return
+
+    channel = ctx.guild.get_channel(channel_id) if ctx.guild else None
+    if not isinstance(channel, discord.TextChannel):
+        await ctx.reply("I cannot access that text channel.", mention_author=False)
+        return
+
+    config = load_config()
+    config["scan_channel_id"] = channel_id
+    save_config(config)
+    await ctx.reply(f"Scan channel set to {channel.mention}.", mention_author=False)
+
+
+@bot.command(name="setlogchannel")
+@commands.has_permissions(manage_guild=True)
+async def set_log_channel(ctx: commands.Context, channel_id: int | None = None) -> None:
+    if channel_id is None:
+        await ctx.reply("Use `!setlogchannel [channel_id]`.", mention_author=False)
+        return
+
+    channel = ctx.guild.get_channel(channel_id) if ctx.guild else None
+    if not isinstance(channel, discord.TextChannel):
+        await ctx.reply("I cannot access that text channel.", mention_author=False)
+        return
+
+    config = load_config()
+    config["log_channel_id"] = channel_id
+    save_config(config)
+    await ctx.reply(f"Log channel set to {channel.mention}.", mention_author=False)
+
+
+@bot.command(name="clearscanchannel")
+@commands.has_permissions(manage_guild=True)
+async def clear_scan_channel(ctx: commands.Context) -> None:
+    config = load_config()
+    config.pop("scan_channel_id", None)
+    save_config(config)
+    await ctx.reply("Scan channel restriction cleared.", mention_author=False)
+
+
+@bot.command(name="help")
+async def help_cmd(ctx: commands.Context) -> None:
+    await ctx.send(
+        "```txt\n"
+        "OCR Reservation Bot\n\n"
+        "Scanning:\n"
+        "!scan                 Scan an attached image\n"
+        "!scan debug           Scan and show row OCR lines\n"
+        "!confirm [id]         Save detected reservations\n"
+        "!confirm [id] replace Save and replace that battlegroup\n"
+        "!reject [id]          Discard pending scan\n\n"
+        "Viewing:\n"
+        "!list                 Show all saved reservations\n"
+        "!viewbg [number]      Show one battlegroup\n\n"
+        "Data management:\n"
+        "!rename [old] [new]   Rename a saved player\n"
+        "!clear [player]       Remove a saved player from all BGs\n"
+        "!wipe CONFIRM         Clear all data\n"
+        "!exportdata           Export reservations.json\n"
+        "!importdata           Import attached reservations.json\n\n"
+        "Setup:\n"
+        "!setscanchannel [id]  Restrict scans to one channel\n"
+        "!clearscanchannel     Remove scan-channel restriction\n"
+        "!setlogchannel [id]   Set admin log channel\n"
+        "```"
+    )
+
+
+@scan.error
+@confirm.error
+@reject.error
+@list_all.error
+@view_bg.error
+@rename.error
+@clear.error
+@wipe.error
+@export_data.error
+@import_data.error
+@set_scan_channel.error
+@set_log_channel.error
+@clear_scan_channel.error
+async def command_error(ctx: commands.Context, error: commands.CommandError) -> None:
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.reply("You do not have permission to use that command.", mention_author=False)
+        return
+    await ctx.reply(f"Command error: `{type(error).__name__}: {error}`", mention_author=False)
 
 
 bot.run(TOKEN)

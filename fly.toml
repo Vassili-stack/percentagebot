@@ -6,12 +6,6 @@ primary_region = "sea"
 [processes]
 bot = "python main.py"
 
-[http_service]
-internal_port = 8080
-auto_stop_machines = false
-auto_start_machines = true
-processes = ["bot"]
-
 [mounts]
 source = "datavol"
 destination = "/data"
