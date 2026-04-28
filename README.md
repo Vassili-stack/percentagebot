@@ -1,15 +1,23 @@
-# Percentagebot OCR Reservation Rebuild v5
+# PercentageBot OCR rebuild
 
-This version is built for the smallest Fly machine.
+This rebuild only tracks reserved players by battlegroup.
 
-It removes OpenCV, NumPy, EasyOCR, and pytesseract. OCR is done by calling the system `tesseract` binary directly through subprocess. This keeps the Python process much lighter.
+## Runtime model
 
-## Deploy
+The bot uses:
 
-Set your Discord token once:
+- py-cord for Discord
+- Pillow for cropping and preprocessing
+- the system Tesseract binary through subprocess
+
+It does not use EasyOCR, OpenCV, NumPy, or pytesseract. This keeps memory lower on Fly.
+
+## Fly setup
+
+Set the token:
 
 ```bash
-fly secrets set DISCORD_TOKEN="your_token_here" -a percentagebot
+fly secrets set DISCORD_TOKEN="YOUR_TOKEN" -a percentagebot
 ```
 
 Deploy:
@@ -18,35 +26,56 @@ Deploy:
 fly deploy -a percentagebot
 ```
 
-## Scan commands
+The included `fly.toml` sets the machine to 512 MB shared CPU.
+
+## Discord command flow
+
+Recommended scan command:
 
 ```txt
-!scan
-!scan debug
-!scan bg2
-!confirm [scan_id]
-!confirm [scan_id] replace
-!reject [scan_id]
+!scan bg2 debug
 ```
 
-Use `!scan bg2` when the image is BG2 and you do not care about reading the header. The bot will still OCR the reserved names.
-
-## Data commands
+Once the output looks correct:
 
 ```txt
+!confirm SCANID
+```
+
+To replace the saved names for that battlegroup:
+
+```txt
+!confirm SCANID replace
+```
+
+## Commands
+
+```txt
+!scan bg2
+!scan bg2 debug
+!confirm SCANID
+!confirm SCANID replace
+!reject SCANID
 !list
-!viewbg [number]
-!rename [old] [new]
-!clear [player]
-!wipe CONFIRM
+!viewbg 2
+!rename "Old Name" "New Name"
+!clear "Player Name"
+!clearbg 2
+!wipe confirm
 !exportdata
 !importdata
+!setscanchannel CHANNEL_ID
+!setlogchannel CHANNEL_ID
+!config
 ```
 
-## Setup commands
+## Notes
 
-```txt
-!setscanchannel [channel_id]
-!clearscanchannel
-!setlogchannel [channel_id]
-```
+Use the manual battlegroup argument, such as `bg1`, `bg2`, or `bg3`. It avoids wasting OCR memory on the header and is more reliable.
+
+The bot searches for an image in this order:
+
+1. Attachment on the command message
+2. Attachment on the replied-to message
+3. Most recent image in the last 10 channel messages
+

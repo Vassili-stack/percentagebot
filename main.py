@@ -1,432 +1,487 @@
-from __future__ import annotations
-
 import asyncio
+import io
+import json
 import os
-import re
 import secrets
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Optional
+import shlex
+import traceback
+from dataclasses import asdict
+from typing import Optional
 
 import discord
-from discord.ext import commands
 
-from ocr_parser import parse_battlegroup_screenshot
+from ocr_parser import parse_battlegroup_image
 from storage import (
-    RESERVATIONS_PATH,
+    clear_bg,
     load_config,
-    load_reservations,
-    merge_bg_reservations,
+    load_data,
     remove_player,
     rename_player,
     save_config,
+    save_data,
     save_reservations,
     wipe_all,
 )
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN:
-    raise RuntimeError("Missing DISCORD_TOKEN environment variable.")
+PREFIX = os.getenv("BOT_PREFIX", "!")
+MAX_MESSAGE = 1850
 
 intents = discord.Intents.default()
 intents.message_content = True
-
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
-PENDING_SCANS: dict[str, dict[str, Any]] = {}
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
-OCR_LOCK = asyncio.Lock()
+bot = discord.Client(intents=intents)
+scan_lock = asyncio.Lock()
+pending_scans = {}
 
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
 
 
-def is_image_attachment(att: discord.Attachment) -> bool:
-    if att.content_type and att.content_type.startswith("image/"):
-        return True
-    return Path(att.filename.lower()).suffix in IMAGE_EXTS
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    content = (message.content or "").strip()
+    if not content.startswith(PREFIX):
+        return
+
+    body = content[len(PREFIX):].strip()
+    if not body:
+        return
+
+    command, args_text = split_command(body)
+    command = command.lower()
+
+    try:
+        if command == "scan":
+            await cmd_scan(message, args_text)
+        elif command == "confirm":
+            await cmd_confirm(message, args_text)
+        elif command == "reject":
+            await cmd_reject(message, args_text)
+        elif command == "list":
+            await cmd_list(message)
+        elif command == "viewbg":
+            await cmd_viewbg(message, args_text)
+        elif command == "clearbg":
+            await cmd_clearbg(message, args_text)
+        elif command == "clear":
+            await cmd_clear_player(message, args_text)
+        elif command == "rename":
+            await cmd_rename(message, args_text)
+        elif command == "wipe":
+            await cmd_wipe(message, args_text)
+        elif command == "exportdata":
+            await cmd_exportdata(message)
+        elif command == "importdata":
+            await cmd_importdata(message)
+        elif command == "setlogchannel":
+            await cmd_set_channel(message, args_text, "log_channel_id", "log channel")
+        elif command == "setscanchannel":
+            await cmd_set_channel(message, args_text, "scan_channel_id", "scan channel")
+        elif command == "config":
+            await cmd_config(message)
+        elif command in {"help", "commands"}:
+            await cmd_help(message)
+    except Exception as error:
+        print(traceback.format_exc())
+        await send_code(message.channel, f"Error: {type(error).__name__}: {error}")
 
 
-def manual_bg_from_args(args: tuple[str, ...]) -> Optional[int]:
-    joined = " ".join(args).lower()
-    match = re.search(r"\bbg\s*([1-9])\b", joined)
-    if match:
-        return int(match.group(1))
-    for arg in args:
-        if arg.isdigit() and 1 <= int(arg) <= 9:
-            return int(arg)
+def split_command(text: str) -> tuple[str, str]:
+    parts = text.split(maxsplit=1)
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], parts[1]
+
+
+def parse_bg_arg(args_text: str) -> tuple[Optional[int], bool]:
+    bg = None
+    debug = False
+    for token in args_text.split():
+        clean = token.lower().strip()
+        if clean == "debug":
+            debug = True
+            continue
+        if clean.startswith("bg"):
+            clean = clean[2:]
+        if clean.isdigit():
+            number = int(clean)
+            if 1 <= number <= 3:
+                bg = number
+    return bg, debug
+
+
+async def cmd_scan(message: discord.Message, args_text: str):
+    config = load_config()
+    scan_channel_id = config.get("scan_channel_id")
+    if scan_channel_id and message.channel.id != int(scan_channel_id):
+        await message.reply(f"Scans are set to <#{scan_channel_id}>.")
+        return
+
+    bg_override, debug = parse_bg_arg(args_text)
+    image_bytes = await find_image_for_scan(message)
+    if image_bytes is None:
+        await message.reply("No image found. Attach a screenshot, reply to one, or send the scan command right after the screenshot.")
+        return
+
+    async with scan_lock:
+        await message.channel.typing()
+        result = await asyncio.to_thread(parse_battlegroup_image, image_bytes, bg_override)
+
+    scan_id = secrets.token_hex(3).upper()
+    pending_scans[scan_id] = {
+        "battlegroup": result.battlegroup,
+        "reserved_names": result.reserved_names,
+        "author_id": message.author.id,
+    }
+
+    output = format_scan_result(scan_id, result, debug)
+    await send_code(message.channel, output)
+
+
+async def find_image_for_scan(message: discord.Message) -> Optional[bytes]:
+    image = await first_image_bytes(message.attachments)
+    if image is not None:
+        return image
+
+    if message.reference and message.reference.resolved:
+        resolved = message.reference.resolved
+        if isinstance(resolved, discord.Message):
+            image = await first_image_bytes(resolved.attachments)
+            if image is not None:
+                return image
+
+    async for old in message.channel.history(limit=10, before=message):
+        if old.author.bot:
+            continue
+        image = await first_image_bytes(old.attachments)
+        if image is not None:
+            return image
+
     return None
 
 
-async def get_scan_attachments(ctx: commands.Context) -> list[discord.Attachment]:
-    attachments = [att for att in ctx.message.attachments if is_image_attachment(att)]
-    if attachments:
-        return attachments
-
-    if ctx.message.reference and ctx.message.reference.resolved:
-        ref = ctx.message.reference.resolved
-        if isinstance(ref, discord.Message):
-            return [att for att in ref.attachments if is_image_attachment(att)]
-
-    return []
+async def first_image_bytes(attachments) -> Optional[bytes]:
+    for attachment in attachments:
+        name = (attachment.filename or "").lower()
+        content_type = attachment.content_type or ""
+        is_image = content_type.startswith("image/") or name.endswith((".png", ".jpg", ".jpeg", ".webp"))
+        if is_image:
+            return await attachment.read()
+    return None
 
 
-async def log_action(guild: Optional[discord.Guild], message: str) -> None:
-    if guild is None:
-        return
-
-    config = load_config()
-    channel_id = config.get("log_channel_id")
-    if not channel_id:
-        return
-
-    channel = guild.get_channel(int(channel_id))
-    if isinstance(channel, discord.TextChannel):
-        try:
-            await channel.send(message)
-        except discord.HTTPException:
-            pass
-
-
-def scan_channel_allowed(ctx: commands.Context) -> bool:
-    config = load_config()
-    channel_id = config.get("scan_channel_id")
-    if not channel_id:
-        return True
-    return int(channel_id) == ctx.channel.id
-
-
-def format_scan_result(scan_id: str, result: dict[str, Any], debug: bool = False) -> str:
-    bg = result.get("battlegroup")
-    names = result.get("reserved", [])
-
-    bg_text = "BG" + str(bg) if bg is not None else "not detected"
+def format_scan_result(scan_id: str, result, debug: bool) -> str:
+    bg = result.battlegroup if result.battlegroup is not None else "not detected"
     lines = [
-        "Scan ID: " + scan_id,
-        "Battlegroup: " + bg_text,
+        f"Scan ID: {scan_id}",
+        f"Battlegroup: {bg}",
         "",
         "Reserved detected:",
     ]
 
-    if names:
-        lines.extend("- " + name for name in names)
+    if result.reserved_names:
+        lines.extend(f"- {name}" for name in result.reserved_names)
     else:
         lines.append("- None detected")
 
-    if debug or not names:
-        lines.append("")
-        lines.append("Header OCR: " + (result.get("header_ocr", "").strip() or "empty"))
-        lines.append("")
-        lines.append("Row OCR lines:")
-        row_lines = result.get("row_ocr_lines", [])
-        if row_lines:
-            lines.extend("- " + line for line in row_lines[:20])
-        else:
-            lines.append("- empty")
+    if debug:
+        lines.extend([
+            "",
+            f"Panel box: {result.panel_box}",
+            f"Header OCR: {result.header_text or '(manual or empty)'}",
+            "",
+            "Row debug:",
+        ])
+        for row in result.rows:
+            detected = row.name if row.name else "none"
+            lines.append(f"Row {row.row}: reserved={row.reserved} name={detected}")
+            if row.cleaned_lines:
+                for item in row.cleaned_lines:
+                    lines.append(f"  - {item}")
+            else:
+                lines.append("  - no text")
 
     lines.extend([
         "",
-        "Save: !confirm " + scan_id,
-        "Save and replace that BG: !confirm " + scan_id + " replace",
-        "Reject: !reject " + scan_id,
-        "Manual BG override while scanning: !scan bg2",
+        f"Save: {PREFIX}confirm {scan_id}",
+        f"Save and replace that BG: {PREFIX}confirm {scan_id} replace",
+        f"Reject: {PREFIX}reject {scan_id}",
     ])
-
-    return "```txt\n" + "\n".join(lines) + "\n```"
-
-
-@bot.event
-async def on_ready() -> None:
-    print("Logged in as " + str(bot.user))
+    return "\n".join(lines)
 
 
-@bot.command(name="scan")
-async def scan(ctx: commands.Context, *args: str) -> None:
-    if not scan_channel_allowed(ctx):
-        await ctx.reply("Scans are restricted to the configured scan channel.", mention_author=False)
+async def cmd_confirm(message: discord.Message, args_text: str):
+    parts = args_text.split()
+    if not parts:
+        await message.reply("Use: !confirm SCANID")
         return
 
-    attachments = await get_scan_attachments(ctx)
-    if not attachments:
-        await ctx.reply("Attach an image to !scan, or reply to an image with !scan.", mention_author=False)
+    scan_id = parts[0].upper()
+    replace = any(part.lower() == "replace" for part in parts[1:])
+    scan = pending_scans.get(scan_id)
+    if not scan:
+        await message.reply("That scan ID is not pending.")
         return
 
-    debug = any(arg.lower() == "debug" for arg in args)
-    manual_bg = manual_bg_from_args(args)
-
-    for attachment in attachments:
-        try:
-            image_bytes = await attachment.read()
-            async with OCR_LOCK:
-                result = await asyncio.to_thread(parse_battlegroup_screenshot, image_bytes)
-            if manual_bg is not None:
-                result["battlegroup"] = manual_bg
-        except Exception as exc:
-            await ctx.reply("OCR failed: `" + type(exc).__name__ + ": " + str(exc) + "`", mention_author=False)
-            continue
-
-        scan_id = secrets.token_hex(3).upper()
-        PENDING_SCANS[scan_id] = {
-            "result": result,
-            "user_id": ctx.author.id,
-            "channel_id": ctx.channel.id,
-            "message_id": ctx.message.id,
-            "attachment": attachment.filename,
-            "created_at": utc_now_iso(),
-        }
-        await ctx.send(format_scan_result(scan_id, result, debug=debug))
-
-
-@bot.command(name="confirm")
-async def confirm(ctx: commands.Context, scan_id: Optional[str] = None, mode: Optional[str] = None) -> None:
-    if not scan_id:
-        await ctx.reply("Use !confirm [scan_id] or !confirm [scan_id] replace.", mention_author=False)
-        return
-
-    scan_id = scan_id.upper()
-    pending = PENDING_SCANS.get(scan_id)
-    if not pending:
-        await ctx.reply("No pending scan with that ID.", mention_author=False)
-        return
-
-    result = pending["result"]
-    bg = result.get("battlegroup")
-    names = result.get("reserved", [])
-
+    bg = scan.get("battlegroup")
+    names = scan.get("reserved_names") or []
     if bg is None:
-        await ctx.reply("Cannot save: battlegroup was not detected. Rescan with !scan bg2 if needed.", mention_author=False)
+        await message.reply("Battlegroup was not detected. Re-scan with something like !scan bg2.")
         return
-
     if not names:
-        await ctx.reply("Cannot save: no reserved players were detected.", mention_author=False)
+        await message.reply("No reserved names were detected, so nothing was saved.")
         return
 
-    replace = bool(mode and mode.lower() == "replace")
-    meta = {
-        "confirmed_by": str(ctx.author),
-        "confirmed_at": utc_now_iso(),
-        "source_message_id": str(pending.get("message_id")),
-        "source_attachment": pending.get("attachment"),
-    }
+    save_reservations(int(bg), names, replace=replace)
+    pending_scans.pop(scan_id, None)
 
-    merge_bg_reservations(int(bg), names, replace=replace, meta=meta)
-    del PENDING_SCANS[scan_id]
-
-    action = "replaced" if replace else "saved"
-    await ctx.reply("BG" + str(bg) + " reservations " + action + ": " + ", ".join(names), mention_author=False)
-    await log_action(ctx.guild, "`" + str(ctx.author) + "` confirmed scan `" + scan_id + "` for BG" + str(bg) + ": " + ", ".join(names))
+    mode = "replaced" if replace else "saved"
+    await send_code(message.channel, f"BG{bg} {mode}:\n" + "\n".join(f"- {n}" for n in names))
+    await log_action(message, f"Confirmed scan {scan_id} for BG{bg} with {len(names)} reserved players.")
 
 
-@bot.command(name="reject")
-async def reject(ctx: commands.Context, scan_id: Optional[str] = None) -> None:
+async def cmd_reject(message: discord.Message, args_text: str):
+    scan_id = args_text.strip().upper()
     if not scan_id:
-        await ctx.reply("Use !reject [scan_id].", mention_author=False)
+        await message.reply("Use: !reject SCANID")
         return
-
-    scan_id = scan_id.upper()
-    if PENDING_SCANS.pop(scan_id, None):
-        await ctx.reply("Rejected scan `" + scan_id + "`.", mention_author=False)
+    if pending_scans.pop(scan_id, None):
+        await message.reply(f"Rejected scan {scan_id}.")
     else:
-        await ctx.reply("No pending scan with that ID.", mention_author=False)
+        await message.reply("That scan ID is not pending.")
 
 
-@bot.command(name="list")
-async def list_all(ctx: commands.Context) -> None:
-    data = load_reservations()
-    bgs = data.get("battlegroups", {})
-    if not bgs:
-        await ctx.reply("No reservations saved.", mention_author=False)
+async def cmd_list(message: discord.Message):
+    data = load_data()
+    groups = data.get("battlegroups", {})
+    if not groups:
+        await send_code(message.channel, "No reservations saved yet.")
         return
 
     lines = []
-    for bg_key in sorted(bgs.keys(), key=lambda value: int(value) if value.isdigit() else value):
-        names = bgs[bg_key].get("reserved", [])
-        lines.append("BG" + str(bg_key) + ":")
-        if names:
-            lines.extend("- " + name for name in names)
-        else:
-            lines.append("- None")
+    for bg_key in sorted(groups, key=lambda x: int(x) if str(x).isdigit() else 999):
+        names = groups.get(bg_key, [])
+        lines.append(f"BG{bg_key}: {len(names)} reserved")
+        for name in names:
+            lines.append(f"- {name}")
         lines.append("")
+    await send_code(message.channel, "\n".join(lines).strip())
 
-    await ctx.send("```txt\n" + "\n".join(lines).strip() + "\n```")
 
-
-@bot.command(name="viewbg")
-async def view_bg(ctx: commands.Context, bg: Optional[str] = None) -> None:
-    if not bg:
-        await ctx.reply("Use !viewbg [number].", mention_author=False)
+async def cmd_viewbg(message: discord.Message, args_text: str):
+    bg = parse_single_bg(args_text)
+    if bg is None:
+        await message.reply("Use: !viewbg 2")
         return
 
-    data = load_reservations()
-    bg_data = data.get("battlegroups", {}).get(str(bg))
-    if not bg_data:
-        await ctx.reply("No saved reservations for BG" + str(bg) + ".", mention_author=False)
+    names = load_data().get("battlegroups", {}).get(str(bg), [])
+    if not names:
+        await send_code(message.channel, f"BG{bg}: no reserved players saved.")
         return
-
-    names = bg_data.get("reserved", [])
-    lines = ["BG" + str(bg) + ":"]
-    if names:
-        lines.extend("- " + name for name in names)
-    else:
-        lines.append("- None")
-    await ctx.send("```txt\n" + "\n".join(lines) + "\n```")
+    await send_code(message.channel, f"BG{bg}:\n" + "\n".join(f"- {n}" for n in names))
 
 
-@bot.command(name="rename")
-async def rename(ctx: commands.Context, old_name: Optional[str] = None, *, new_name: Optional[str] = None) -> None:
-    if not old_name or not new_name:
-        await ctx.reply("Use !rename [old] [new]. Quote names with spaces.", mention_author=False)
+def parse_single_bg(text: str) -> Optional[int]:
+    text = text.strip().lower()
+    if text.startswith("bg"):
+        text = text[2:]
+    if text.isdigit():
+        number = int(text)
+        if 1 <= number <= 3:
+            return number
+    return None
+
+
+async def cmd_clearbg(message: discord.Message, args_text: str):
+    bg = parse_single_bg(args_text)
+    if bg is None:
+        await message.reply("Use: !clearbg 2")
         return
+    clear_bg(bg)
+    await message.reply(f"Cleared BG{bg}.")
+    await log_action(message, f"Cleared BG{bg}.")
 
-    changed = rename_player(old_name, new_name)
-    await ctx.reply("Renamed " + str(changed) + " matching entries.", mention_author=False)
-    await log_action(ctx.guild, "`" + str(ctx.author) + "` renamed `" + old_name + "` to `" + new_name + "`")
 
-
-@bot.command(name="clear")
-async def clear(ctx: commands.Context, *, player_name: Optional[str] = None) -> None:
-    if not player_name:
-        await ctx.reply("Use !clear [player].", mention_author=False)
+async def cmd_clear_player(message: discord.Message, args_text: str):
+    name = args_text.strip().strip('"')
+    if not name:
+        await message.reply('Use: !clear "Player Name"')
         return
-
-    removed = remove_player(player_name)
-    await ctx.reply("Removed " + str(removed) + " matching entries for `" + player_name + "`.", mention_author=False)
-    await log_action(ctx.guild, "`" + str(ctx.author) + "` cleared `" + player_name + "`")
-
-
-@bot.command(name="wipe")
-async def wipe(ctx: commands.Context, confirmation: Optional[str] = None) -> None:
-    if confirmation != "CONFIRM":
-        await ctx.reply("This clears all saved reservations. Use !wipe CONFIRM.", mention_author=False)
-        return
-
-    wipe_all()
-    await ctx.reply("All saved reservations wiped.", mention_author=False)
-    await log_action(ctx.guild, "`" + str(ctx.author) + "` wiped all reservations")
+    changed = remove_player(name)
+    await message.reply("Removed player." if changed else "Player was not found.")
+    if changed:
+        await log_action(message, f"Removed player: {name}")
 
 
-@bot.command(name="exportdata")
-async def export_data(ctx: commands.Context) -> None:
-    if not RESERVATIONS_PATH.exists():
-        save_reservations({"battlegroups": {}})
-    await ctx.reply(file=discord.File(str(RESERVATIONS_PATH), filename="reservations.json"), mention_author=False)
-
-
-@bot.command(name="importdata")
-async def import_data(ctx: commands.Context) -> None:
-    attachments = ctx.message.attachments
-    if not attachments:
-        await ctx.reply("Attach reservations.json to !importdata.", mention_author=False)
-        return
-
-    attachment = attachments[0]
+async def cmd_rename(message: discord.Message, args_text: str):
     try:
-        raw = await attachment.read()
-        import json
+        parts = shlex.split(args_text)
+    except ValueError:
+        parts = []
+    if len(parts) < 2:
+        await message.reply('Use: !rename "Old Name" "New Name"')
+        return
+    old, new = parts[0], parts[1]
+    changed = rename_player(old, new)
+    await message.reply("Renamed player." if changed else "Old name was not found.")
+    if changed:
+        await log_action(message, f"Renamed player: {old} to {new}")
+
+
+async def cmd_wipe(message: discord.Message, args_text: str):
+    if args_text.strip().lower() != "confirm":
+        await message.reply("Use !wipe confirm to delete all saved reservations.")
+        return
+    wipe_all()
+    await message.reply("All saved reservations wiped.")
+    await log_action(message, "Wiped all reservation data.")
+
+
+async def cmd_exportdata(message: discord.Message):
+    data = load_data()
+    payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    file = discord.File(io.BytesIO(payload), filename="reservations_backup.json")
+    await message.channel.send("Exported reservation data.", file=file)
+
+
+async def cmd_importdata(message: discord.Message):
+    if not message.attachments:
+        await message.reply("Attach a JSON backup to import.")
+        return
+
+    attachment = message.attachments[0]
+    raw = await attachment.read()
+    try:
         data = json.loads(raw.decode("utf-8"))
-        if not isinstance(data, dict) or "battlegroups" not in data:
-            raise ValueError("JSON must contain a battlegroups object.")
-        save_reservations(data)
-    except Exception as exc:
-        await ctx.reply("Import failed: `" + type(exc).__name__ + ": " + str(exc) + "`", mention_author=False)
+    except Exception:
+        await message.reply("That attachment is not valid JSON.")
         return
 
-    await ctx.reply("Imported reservations data.", mention_author=False)
-    await log_action(ctx.guild, "`" + str(ctx.author) + "` imported reservations data")
+    if not isinstance(data, dict) or not isinstance(data.get("battlegroups"), dict):
+        await message.reply("Backup must contain a battlegroups object.")
+        return
+
+    save_data(data)
+    await message.reply("Imported reservation data.")
+    await log_action(message, "Imported reservation data from backup.")
 
 
-@bot.command(name="setscanchannel")
-@commands.has_permissions(manage_guild=True)
-async def set_scan_channel(ctx: commands.Context, channel_id: Optional[int] = None) -> None:
+async def cmd_set_channel(message: discord.Message, args_text: str, key: str, label: str):
+    channel_id = extract_channel_id(args_text)
     if channel_id is None:
-        await ctx.reply("Use !setscanchannel [channel_id].", mention_author=False)
+        await message.reply(f"Use: !set{label.replace(' ', '')} CHANNEL_ID")
         return
 
-    channel = ctx.guild.get_channel(channel_id) if ctx.guild else None
-    if not isinstance(channel, discord.TextChannel):
-        await ctx.reply("I cannot access that text channel.", mention_author=False)
-        return
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception:
+            channel = None
 
-    config = load_config()
-    config["scan_channel_id"] = channel_id
-    save_config(config)
-    await ctx.reply("Scan channel set to " + channel.mention + ".", mention_author=False)
-
-
-@bot.command(name="setlogchannel")
-@commands.has_permissions(manage_guild=True)
-async def set_log_channel(ctx: commands.Context, channel_id: Optional[int] = None) -> None:
-    if channel_id is None:
-        await ctx.reply("Use !setlogchannel [channel_id].", mention_author=False)
-        return
-
-    channel = ctx.guild.get_channel(channel_id) if ctx.guild else None
-    if not isinstance(channel, discord.TextChannel):
-        await ctx.reply("I cannot access that text channel.", mention_author=False)
+    if channel is None:
+        await message.reply("I cannot access that channel.")
         return
 
     config = load_config()
-    config["log_channel_id"] = channel_id
+    config[key] = channel_id
     save_config(config)
-    await ctx.reply("Log channel set to " + channel.mention + ".", mention_author=False)
+    await message.reply(f"Set {label} to <#{channel_id}>.")
 
 
-@bot.command(name="clearscanchannel")
-@commands.has_permissions(manage_guild=True)
-async def clear_scan_channel(ctx: commands.Context) -> None:
+def extract_channel_id(text: str) -> Optional[int]:
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if digits:
+        return int(digits)
+    return None
+
+
+async def cmd_config(message: discord.Message):
     config = load_config()
-    config.pop("scan_channel_id", None)
-    save_config(config)
-    await ctx.reply("Scan channel restriction cleared.", mention_author=False)
+    lines = [
+        "Current config:",
+        f"Log channel: {format_channel(config.get('log_channel_id'))}",
+        f"Scan channel: {format_channel(config.get('scan_channel_id'))}",
+    ]
+    await send_code(message.channel, "\n".join(lines))
 
 
-@bot.command(name="help")
-async def help_cmd(ctx: commands.Context) -> None:
-    await ctx.send(
-        "```txt\n"
-        "OCR Reservation Bot\n\n"
-        "Scanning:\n"
-        "!scan                 Scan an attached image\n"
-        "!scan debug           Scan and show row OCR lines\n"
-        "!scan bg2             Scan and force BG2 if header OCR fails\n"
-        "!confirm [id]         Save detected reservations\n"
-        "!confirm [id] replace Save and replace that battlegroup\n"
-        "!reject [id]          Discard pending scan\n\n"
-        "Viewing:\n"
-        "!list                 Show all saved reservations\n"
-        "!viewbg [number]      Show one battlegroup\n\n"
-        "Data management:\n"
-        "!rename [old] [new]   Rename a saved player\n"
-        "!clear [player]       Remove a saved player from all BGs\n"
-        "!wipe CONFIRM         Clear all data\n"
-        "!exportdata           Export reservations.json\n"
-        "!importdata           Import attached reservations.json\n\n"
-        "Setup:\n"
-        "!setscanchannel [id]  Restrict scans to one channel\n"
-        "!clearscanchannel     Remove scan-channel restriction\n"
-        "!setlogchannel [id]   Set admin log channel\n"
-        "```"
-    )
+def format_channel(channel_id):
+    if channel_id:
+        return f"<#{channel_id}>"
+    return "not set"
 
 
-@scan.error
-@confirm.error
-@reject.error
-@list_all.error
-@view_bg.error
-@rename.error
-@clear.error
-@wipe.error
-@export_data.error
-@import_data.error
-@set_scan_channel.error
-@set_log_channel.error
-@clear_scan_channel.error
-async def command_error(ctx: commands.Context, error: commands.CommandError) -> None:
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.reply("You do not have permission to use that command.", mention_author=False)
+async def cmd_help(message: discord.Message):
+    text = """
+OCR commands
+!scan bg2
+!scan bg2 debug
+!confirm SCANID
+!confirm SCANID replace
+!reject SCANID
+
+Viewing
+!list
+!viewbg 2
+
+Data management
+!rename "Old Name" "New Name"
+!clear "Player Name"
+!clearbg 2
+!wipe confirm
+!exportdata
+!importdata
+
+Setup
+!setscanchannel CHANNEL_ID
+!setlogchannel CHANNEL_ID
+!config
+""".strip()
+    await send_code(message.channel, text)
+
+
+async def log_action(message: discord.Message, text: str):
+    config = load_config()
+    channel_id = config.get("log_channel_id")
+    if not channel_id:
         return
-    await ctx.reply("Command error: `" + type(error).__name__ + ": " + str(error) + "`", mention_author=False)
+    channel = bot.get_channel(int(channel_id))
+    if channel is None:
+        return
+    await channel.send(f"{message.author} used {message.content}\n{text}")
 
+
+async def send_code(channel, text: str):
+    if len(text) <= MAX_MESSAGE:
+        await channel.send(f"```txt\n{text}\n```")
+        return
+
+    chunks = []
+    current = []
+    current_len = 0
+    for line in text.splitlines():
+        added = len(line) + 1
+        if current_len + added > MAX_MESSAGE:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = added
+        else:
+            current.append(line)
+            current_len += added
+    if current:
+        chunks.append("\n".join(current))
+
+    for chunk in chunks:
+        await channel.send(f"```txt\n{chunk}\n```")
+
+
+if not TOKEN:
+    raise RuntimeError("Missing DISCORD_TOKEN environment variable.")
 
 bot.run(TOKEN)

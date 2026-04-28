@@ -1,321 +1,347 @@
-from __future__ import annotations
-
 import io
 import os
 import re
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from difflib import SequenceMatcher
-from typing import Any, Optional
+from typing import Optional
 
-from PIL import Image, ImageEnhance, ImageOps
-
-RESERVED_TARGET = "RESERVED"
+from PIL import Image, ImageOps, ImageFilter
 
 
-def _pil_from_bytes(image_bytes: bytes) -> Image.Image:
-    image = Image.open(io.BytesIO(image_bytes))
-    image = ImageOps.exif_transpose(image)
-    return image.convert("RGB")
+@dataclass
+class RowDebug:
+    row: int
+    raw_text: str
+    cleaned_lines: list[str]
+    reserved: bool
+    name: Optional[str]
+    box: tuple[int, int, int, int]
 
 
-def _clean_line(text: str) -> str:
-    text = text.replace("—", "-").replace("–", "-")
-    text = text.replace("\n", " ")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+@dataclass
+class ScanResult:
+    battlegroup: Optional[int]
+    reserved_names: list[str]
+    header_text: str
+    rows: list[RowDebug]
+    panel_box: tuple[int, int, int, int]
 
 
-def _find_panel_bounds(image: Image.Image) -> tuple[int, int, int, int]:
-    width, height = image.size
-    small_w = 512
-    small_h = max(1, int(height * small_w / max(1, width)))
-    small = image.resize((small_w, small_h), Image.Resampling.BILINEAR).convert("RGB")
-    pixels = small.load()
+STATUS_WORDS = [
+    "RESERVED",
+    "RESERVE",
+    "RESEKVED",
+    "RE5ERVED",
+    "ASSIGNED",
+    "KO",
+    "K.O",
+]
 
+BAD_NAME_WORDS = {
+    "RESERVED",
+    "RESERVE",
+    "ASSIGNED",
+    "LEGEND",
+    "VETERAN",
+    "KO",
+    "K.O",
+    "HEALTH",
+    "INFO",
+    "ITEMS",
+    "ATTACK",
+    "TACTICS",
+    "BATTLEGROUP",
+}
+
+
+def parse_battlegroup_image(image_bytes: bytes, battlegroup_override: Optional[int] = None) -> ScanResult:
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image = normalize_input_size(image)
+    panel = find_panel_box(image)
+
+    header_text = ""
+    battlegroup = battlegroup_override
+    if battlegroup is None:
+        header_box = relative_box(panel, 0.28, 0.035, 0.72, 0.155)
+        header_text = run_tesseract(prep_text_crop(image.crop(header_box), scale=3), psm=7)
+        battlegroup = extract_battlegroup(header_text)
+
+    rows = []
+    reserved_names = []
+
+    for index, row_box in enumerate(row_boxes(panel), start=1):
+        raw_text = run_tesseract(prep_text_crop(image.crop(row_box), scale=4), psm=6)
+        lines = clean_ocr_lines(raw_text)
+        reserved = lines_have_reserved(lines)
+        name = extract_name_from_lines(lines) if reserved else None
+
+        if reserved and name:
+            reserved_names.append(name)
+
+        rows.append(RowDebug(
+            row=index,
+            raw_text=raw_text,
+            cleaned_lines=lines,
+            reserved=reserved,
+            name=name,
+            box=row_box,
+        ))
+
+    return ScanResult(
+        battlegroup=battlegroup,
+        reserved_names=unique_keep_order(reserved_names),
+        header_text=header_text,
+        rows=rows,
+        panel_box=panel,
+    )
+
+
+def normalize_input_size(image: Image.Image) -> Image.Image:
+    # Large phone screenshots make Tesseract use more memory. This keeps text readable
+    # while preventing unnecessary OCR memory spikes.
+    max_width = 1600
+    if image.width <= max_width:
+        return image
+    ratio = max_width / image.width
+    new_size = (max_width, int(image.height * ratio))
+    return image.resize(new_size, Image.Resampling.LANCZOS)
+
+
+def find_panel_box(image: Image.Image) -> tuple[int, int, int, int]:
+    small = image.copy()
+    small.thumbnail((520, 520), Image.Resampling.BILINEAR)
+    sx = image.width / small.width
+    sy = image.height / small.height
+
+    pix = small.load()
     xs = []
     ys = []
-    y_start = int(small_h * 0.02)
-    y_end = int(small_h * 0.96)
-    x_start = int(small_w * 0.10)
-    x_end = int(small_w * 0.92)
 
-    for y in range(y_start, y_end):
-        for x in range(x_start, x_end):
-            red, green, blue = pixels[x, y]
-            mx = max(red, green, blue)
-            mn = min(red, green, blue)
-            avg = (red + green + blue) // 3
-            if mx - mn < 28 and 30 < avg < 120:
+    for y in range(0, small.height, 2):
+        for x in range(0, small.width, 2):
+            r, g, b = pix[x, y]
+            avg = (r + g + b) // 3
+            spread = max(r, g, b) - min(r, g, b)
+            # The central game panel is neutral gray. Space background is darker
+            # and usually blue or purple shifted.
+            if 32 <= avg <= 95 and spread <= 26:
                 xs.append(x)
                 ys.append(y)
 
-    if not xs:
-        return (0, 0, width, height)
+    if not xs or not ys:
+        return default_panel_box(image)
 
-    left = int(min(xs) * width / small_w)
-    top = int(min(ys) * height / small_h)
-    right = int(max(xs) * width / small_w)
-    bottom = int(max(ys) * height / small_h)
+    left = int(max(0, min(xs) * sx))
+    top = int(max(0, min(ys) * sy))
+    right = int(min(image.width, max(xs) * sx))
+    bottom = int(min(image.height, max(ys) * sy))
 
-    panel_w = right - left
-    panel_h = bottom - top
-    if panel_w < width * 0.35 or panel_h < height * 0.35:
-        return (0, 0, width, height)
+    if right - left < image.width * 0.35 or bottom - top < image.height * 0.35:
+        return default_panel_box(image)
 
-    pad_x = int(panel_w * 0.01)
-    pad_y = int(panel_h * 0.01)
-    left = max(0, left - pad_x)
-    top = max(0, top - pad_y)
-    right = min(width, right + pad_x)
-    bottom = min(height, bottom + pad_y)
-
-    return (left, top, right - left, bottom - top)
+    pad_x = int((right - left) * 0.015)
+    pad_y = int((bottom - top) * 0.015)
+    return (
+        max(0, left - pad_x),
+        max(0, top - pad_y),
+        min(image.width, right + pad_x),
+        min(image.height, bottom + pad_y),
+    )
 
 
-def _crop_rel(image: Image.Image, panel: tuple[int, int, int, int], left: float, top: float, right: float, bottom: float) -> Image.Image:
-    px, py, pw, ph = panel
-    width, height = image.size
-    x1 = max(0, min(width, px + int(pw * left)))
-    y1 = max(0, min(height, py + int(ph * top)))
-    x2 = max(0, min(width, px + int(pw * right)))
-    y2 = max(0, min(height, py + int(ph * bottom)))
-    if x2 <= x1 or y2 <= y1:
-        return image.crop((0, 0, 1, 1))
-    return image.crop((x1, y1, x2, y2))
+def default_panel_box(image: Image.Image) -> tuple[int, int, int, int]:
+    return (
+        int(image.width * 0.21),
+        int(image.height * 0.045),
+        int(image.width * 0.78),
+        int(image.height * 0.94),
+    )
 
 
-def _prep_for_tesseract(crop: Image.Image, scale: int = 4, threshold: int = 132) -> Image.Image:
-    gray = ImageOps.grayscale(crop)
-    gray = ImageEnhance.Contrast(gray).enhance(2.1)
-    new_size = (max(1, gray.width * scale), max(1, gray.height * scale))
-    gray = gray.resize(new_size, Image.Resampling.LANCZOS)
+def relative_box(panel: tuple[int, int, int, int], x1: float, y1: float, x2: float, y2: float) -> tuple[int, int, int, int]:
+    px1, py1, px2, py2 = panel
+    w = px2 - px1
+    h = py2 - py1
+    return (
+        int(px1 + w * x1),
+        int(py1 + h * y1),
+        int(px1 + w * x2),
+        int(py1 + h * y2),
+    )
 
-    # Turn pale UI text into black text on a white page.
-    return gray.point(lambda p: 0 if p > threshold else 255, mode="1").convert("L")
+
+def row_boxes(panel: tuple[int, int, int, int]) -> list[tuple[int, int, int, int]]:
+    # Crop only the text column. This deliberately excludes portraits, item boxes,
+    # and most background noise.
+    y_starts = [0.235, 0.410, 0.585, 0.760]
+    boxes = []
+    for y in y_starts:
+        boxes.append(relative_box(panel, 0.165, y, 0.505, y + 0.125))
+    return boxes
 
 
-def _ocr(crop: Image.Image, psm: int = 6, whitelist: Optional[str] = None, timeout: float = 5.0) -> str:
-    processed = _prep_for_tesseract(crop)
-    tmp_name = None
+def prep_text_crop(crop: Image.Image, scale: int = 4) -> Image.Image:
+    gray = crop.convert("L")
+    gray = ImageOps.autocontrast(gray, cutoff=1)
+    gray = gray.filter(ImageFilter.SHARPEN)
+    if scale > 1:
+        gray = gray.resize((gray.width * scale, gray.height * scale), Image.Resampling.LANCZOS)
+    # Light text on dark background. Keep only strong foreground strokes.
+    threshold = 118
+    bw = gray.point(lambda p: 255 if p > threshold else 0)
+    return bw
+
+
+def run_tesseract(image: Image.Image, psm: int = 6) -> str:
+    env = os.environ.copy()
+    env["OMP_THREAD_LIMIT"] = "1"
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as img_file:
+        image.save(img_file.name)
+        image_path = img_file.name
+
     try:
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            tmp_name = tmp.name
-            processed.save(tmp_name, format="PNG")
-
         cmd = [
             "tesseract",
-            tmp_name,
+            image_path,
             "stdout",
-            "-l",
-            "eng",
             "--oem",
             "1",
             "--psm",
             str(psm),
-            "-c",
-            "load_system_dawg=0",
-            "-c",
-            "load_freq_dawg=0",
+            "-l",
+            "eng",
         ]
-        if whitelist:
-            cmd.extend(["-c", "tessedit_char_whitelist=" + whitelist])
-
-        env = os.environ.copy()
-        env["OMP_THREAD_LIMIT"] = "1"
-        proc = subprocess.run(
+        completed = subprocess.run(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=8,
             env=env,
-            check=False,
         )
-        return proc.stdout or ""
+        return completed.stdout.strip()
     except subprocess.TimeoutExpired:
         return ""
-    except Exception:
-        return ""
     finally:
-        if tmp_name:
-            try:
-                os.remove(tmp_name)
-            except OSError:
-                pass
+        try:
+            os.remove(image_path)
+        except OSError:
+            pass
 
 
-def _reserved_score(text: str) -> float:
-    normalized = re.sub(r"[^A-Z]", "", text.upper())
-    if not normalized:
-        return 0.0
-    if RESERVED_TARGET in normalized:
-        return 1.0
-    return SequenceMatcher(None, normalized, RESERVED_TARGET).ratio()
+def extract_battlegroup(text: str) -> Optional[int]:
+    compact = clean_common_ocr(text).upper()
+    match = re.search(r"BATTLEGROUP\s*(\d)", compact)
+    if match:
+        return int(match.group(1))
 
-
-def _is_reserved_line(text: str) -> bool:
-    normalized = re.sub(r"[^A-Z]", "", text.upper())
-    if not normalized:
-        return False
-    if "RESERVED" in normalized:
-        return True
-
-    fragments = [
-        "RESER",
-        "ESERV",
-        "SERVE",
-        "ERVED",
-        "RVED",
-        "RVEL",
-        "RVEI",
-        "RESEV",
-        "ESEV",
-        "RESV",
-        "ERVEDD",
-        "RESERVEO",
-    ]
-    if any(fragment in normalized for fragment in fragments):
-        return True
-
-    if 4 <= len(normalized) <= 15 and "R" in normalized and "E" in normalized and "V" in normalized:
-        return _reserved_score(normalized) >= 0.52
-
-    return False
-
-
-def _clean_player_name(text: str) -> str:
-    text = _clean_line(text)
-    if not text:
-        return ""
-
-    words = []
-    for word in text.split():
-        if _is_reserved_line(word):
-            continue
-        words.append(word)
-    text = " ".join(words)
-
-    banned = [
-        "HEALTH",
-        "INFO",
-        "ITEMS",
-        "ATTACK",
-        "TACTICS",
-        "LEGEND",
-        "VETERAN",
-        "ASSIGNED",
-        "RESERVED",
-        "BATTLEGROUP",
-        "STRAW",
-        "ALLIANCE",
-        "KO",
-        "K.O",
-    ]
-    for word in banned:
-        text = re.sub(r"\b" + re.escape(word) + r"\b", "", text, flags=re.IGNORECASE)
-
-    if re.search(r"\d+(?:\.\d+)?\s*%", text):
-        return ""
-
-    text = text.strip(" \t\r\n:;,.`'\"[]{}()<>«»")
-    text = re.sub(r"\s+", " ", text).strip()
-
-    if len(text) < 3:
-        return ""
-    if len(text) > 40:
-        return ""
-    return text
-
-
-def _extract_name_from_row(row_text: str) -> str:
-    lines = [_clean_line(line) for line in row_text.splitlines()]
-    lines = [line for line in lines if line]
-    if not lines:
-        return ""
-
-    for line in lines:
-        if _is_reserved_line(line):
-            continue
-        cleaned = _clean_player_name(line)
-        if cleaned:
-            return cleaned
-
-    for line in lines:
-        cleaned = _clean_player_name(line)
-        if cleaned:
-            return cleaned
-
-    return ""
-
-
-def _extract_bg_from_text(text: str) -> Optional[int]:
-    raw = text.upper().replace("0", "O")
-    patterns = [
-        r"BATTLEGROUP\s*([1-9])",
-        r"BATTLE\s*GROUP\s*([1-9])",
-        r"GROUP\s*([1-9])",
-        r"BG\s*([1-9])",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, raw)
-        if match:
-            try:
-                return int(match.group(1))
-            except ValueError:
-                return None
+    # Some OCR outputs omit spacing or misread one nearby character.
+    for digit in range(1, 4):
+        if f"BATTLEGROUP{digit}" in compact:
+            return digit
     return None
 
 
-def _extract_battlegroup(image: Image.Image, panel: tuple[int, int, int, int]) -> tuple[Optional[int], str]:
-    header = _crop_rel(image, panel, 0.26, 0.035, 0.78, 0.145)
-    text = _ocr(header, psm=6, timeout=4.0)
-    clean = _clean_line(text)
-    return _extract_bg_from_text(clean), clean
+def clean_common_ocr(text: str) -> str:
+    return (
+        text.replace("BATILEGROUP", "BATTLEGROUP")
+        .replace("BATTLEGR0UP", "BATTLEGROUP")
+        .replace("BATTIEGROUP", "BATTLEGROUP")
+        .replace("BATTLEGROUF", "BATTLEGROUP")
+    )
 
 
-def _row_specs() -> list[tuple[float, float]]:
-    return [
-        (0.235, 0.385),
-        (0.395, 0.545),
-        (0.555, 0.705),
-        (0.715, 0.865),
-    ]
-
-
-def _extract_reserved_names(image: Image.Image, panel: tuple[int, int, int, int]) -> tuple[list[str], list[str]]:
-    reserved = []
-    debug_lines = []
-
-    for row_index, bounds in enumerate(_row_specs(), start=1):
-        top, bottom = bounds
-        row_crop = _crop_rel(image, panel, 0.155, top + 0.018, 0.545, bottom - 0.018)
-        row_text = _ocr(row_crop, psm=6, timeout=5.0)
-        cleaned_row = _clean_line(row_text)
-        debug_lines.append("row " + str(row_index) + ": " + (cleaned_row or "empty"))
-
-        if not _is_reserved_line(row_text):
+def clean_ocr_lines(text: str) -> list[str]:
+    lines = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        line = line.replace(chr(124), "")
+        line = line.replace("‘", "'").replace("’", "'")
+        line = re.sub(r"\s+", " ", line)
+        line = line.strip(" .,:;`\"()[]{}")
+        if not line:
             continue
-
-        name = _extract_name_from_row(row_text)
-        if name and name not in reserved:
-            reserved.append(name)
-
-    return reserved, debug_lines
+        if len(line) == 1 and not line.isalnum():
+            continue
+        lines.append(line)
+    return lines
 
 
-def parse_battlegroup_screenshot(image_bytes: bytes) -> dict[str, Any]:
-    image = _pil_from_bytes(image_bytes)
-    panel = _find_panel_bounds(image)
-    bg, header_ocr = _extract_battlegroup(image, panel)
-    reserved, row_lines = _extract_reserved_names(image, panel)
+def lines_have_reserved(lines: list[str]) -> bool:
+    for line in lines:
+        if looks_like_reserved(line):
+            return True
+    return False
 
-    px, py, pw, ph = panel
-    panel_debug = "panel x=" + str(px) + " y=" + str(py) + " w=" + str(pw) + " h=" + str(ph)
 
-    return {
-        "battlegroup": bg,
-        "reserved": reserved,
-        "header_ocr": header_ocr,
-        "row_ocr_lines": [panel_debug] + row_lines,
-    }
+def looks_like_reserved(line: str) -> bool:
+    cleaned = re.sub(r"[^A-Za-z]", "", line).upper()
+    if "RESERVED" in cleaned:
+        return True
+    if cleaned in {"RESERVE", "RESEKVED", "RE5ERVED", "RESERVEO", "RESERUED"}:
+        return True
+    if SequenceMatcher(None, cleaned, "RESERVED").ratio() >= 0.72:
+        return True
+    return False
+
+
+def extract_name_from_lines(lines: list[str]) -> Optional[str]:
+    candidates = []
+    for line in lines:
+        candidate = remove_status_text(line)
+        candidate = cleanup_name(candidate)
+        if is_plausible_name(candidate):
+            candidates.append(candidate)
+
+    if not candidates:
+        return None
+
+    # Prefer the first plausible player-name line in the row crop.
+    return candidates[0]
+
+
+def remove_status_text(line: str) -> str:
+    result = line
+    for word in STATUS_WORDS:
+        result = re.sub(word, "", result, flags=re.IGNORECASE)
+    return result.strip()
+
+
+def cleanup_name(name: str) -> str:
+    name = name.replace("—", "-").replace("–", "-")
+    name = re.sub(r"\s+", " ", name).strip()
+    name = name.strip(" .,:;`\"()[]{}")
+    return name
+
+
+def is_plausible_name(name: str) -> bool:
+    if not name:
+        return False
+    if len(name) < 2:
+        return False
+
+    letters_digits = sum(ch.isalnum() for ch in name)
+    if letters_digits < 2:
+        return False
+
+    upper = re.sub(r"[^A-Za-z]", "", name).upper()
+    if not upper:
+        return True
+    for bad in BAD_NAME_WORDS:
+        if bad in upper:
+            return False
+    return True
+
+
+def unique_keep_order(values: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for value in values:
+        key = value.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return out
