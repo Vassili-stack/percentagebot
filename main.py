@@ -128,9 +128,9 @@ async def cmd_scan(message: discord.Message, args_text: str):
         await message.reply("No image found. Attach a screenshot, reply to one, or send the scan command right after the screenshot.")
         return
 
-    async with scan_lock:
-        await message.channel.typing()
-        result = await asyncio.to_thread(parse_battlegroup_image, image_bytes, bg_override)
+    async with message.channel.typing():
+        async with scan_lock:
+            result = await asyncio.to_thread(parse_battlegroup_image, image_bytes, bg_override)
 
     scan_id = secrets.token_hex(3).upper()
     pending_scans[scan_id] = {
