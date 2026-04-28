@@ -1,18 +1,15 @@
-# Percentagebot OCR Rebuild
+# Percentagebot OCR Reservation Rebuild v5
 
-This rebuild ignores the old percentage system and only tracks:
+This version is built for the smallest Fly machine.
 
-- Battlegroup number
-- Player names marked `RESERVED`
+It removes OpenCV, NumPy, EasyOCR, and pytesseract. OCR is done by calling the system `tesseract` binary directly through subprocess. This keeps the Python process much lighter.
 
-It is tuned for the MCOC battlegroup screenshots where the text column appears right of the portraits and left of the item/champion boxes.
+## Deploy
 
-## Fly setup
-
-Set the Discord token as a Fly secret:
+Set your Discord token once:
 
 ```bash
-fly secrets set DISCORD_TOKEN="your_discord_bot_token" -a percentagebot
+fly secrets set DISCORD_TOKEN="your_token_here" -a percentagebot
 ```
 
 Deploy:
@@ -21,38 +18,35 @@ Deploy:
 fly deploy -a percentagebot
 ```
 
-The bot writes persistent data to:
-
-```txt
-/data/reservations.json
-/data/config.json
-```
-
-## Commands
+## Scan commands
 
 ```txt
 !scan
 !scan debug
+!scan bg2
 !confirm [scan_id]
 !confirm [scan_id] replace
 !reject [scan_id]
+```
 
+Use `!scan bg2` when the image is BG2 and you do not care about reading the header. The bot will still OCR the reserved names.
+
+## Data commands
+
+```txt
 !list
 !viewbg [number]
-
 !rename [old] [new]
 !clear [player]
 !wipe CONFIRM
 !exportdata
 !importdata
+```
 
+## Setup commands
+
+```txt
 !setscanchannel [channel_id]
 !clearscanchannel
 !setlogchannel [channel_id]
 ```
-
-## OCR notes
-
-Use `!scan debug` when a screenshot fails. The bot will show row OCR lines, which makes crop/OCR tuning easier.
-
-The parser uses Tesseract instead of EasyOCR so it can run on a small Fly VM.

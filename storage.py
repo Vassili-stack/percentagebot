@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -31,6 +31,8 @@ def _write_json(path: Path, data: Any) -> None:
 
 def load_reservations() -> dict[str, Any]:
     data = _read_json(RESERVATIONS_PATH, {"battlegroups": {}})
+    if not isinstance(data, dict):
+        data = {"battlegroups": {}}
     data.setdefault("battlegroups", {})
     return data
 
@@ -51,7 +53,7 @@ def save_config(data: dict[str, Any]) -> None:
     _write_json(CONFIG_PATH, data)
 
 
-def merge_bg_reservations(bg: int, names: list[str], *, replace: bool = False, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+def merge_bg_reservations(bg: int, names: list[str], replace: bool = False, meta: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     data = load_reservations()
     bg_key = str(bg)
     data["battlegroups"].setdefault(bg_key, {"reserved": [], "meta": {}})

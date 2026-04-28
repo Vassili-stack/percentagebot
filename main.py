@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import discord
 from discord.ext import commands
 
 from ocr_parser import parse_battlegroup_screenshot
 from storage import (
-    CONFIG_PATH,
     RESERVATIONS_PATH,
     load_config,
     load_reservations,
@@ -32,11 +32,9 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
-
-# Pending scans live in memory. Confirm soon after scanning.
 PENDING_SCANS: dict[str, dict[str, Any]] = {}
-
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+OCR_LOCK = asyncio.Lock()
 
 
 def utc_now_iso() -> str:
@@ -47,6 +45,17 @@ def is_image_attachment(att: discord.Attachment) -> bool:
     if att.content_type and att.content_type.startswith("image/"):
         return True
     return Path(att.filename.lower()).suffix in IMAGE_EXTS
+
+
+def manual_bg_from_args(args: tuple[str, ...]) -> Optional[int]:
+    joined = " ".join(args).lower()
+    match = re.search(r"\bbg\s*([1-9])\b", joined)
+    if match:
+        return int(match.group(1))
+    for arg in args:
+        if arg.isdigit() and 1 <= int(arg) <= 9:
+            return int(arg)
+    return None
 
 
 async def get_scan_attachments(ctx: commands.Context) -> list[discord.Attachment]:
@@ -62,7 +71,7 @@ async def get_scan_attachments(ctx: commands.Context) -> list[discord.Attachment
     return []
 
 
-async def log_action(guild: discord.Guild | None, message: str) -> None:
+async def log_action(guild: Optional[discord.Guild], message: str) -> None:
     if guild is None:
         return
 
@@ -91,37 +100,36 @@ def format_scan_result(scan_id: str, result: dict[str, Any], debug: bool = False
     bg = result.get("battlegroup")
     names = result.get("reserved", [])
 
+    bg_text = "BG" + str(bg) if bg is not None else "not detected"
     lines = [
-        f"Scan ID: {scan_id}",
-        f"Battlegroup: {bg if bg is not None else 'not detected'}",
+        "Scan ID: " + scan_id,
+        "Battlegroup: " + bg_text,
         "",
         "Reserved detected:",
     ]
 
     if names:
-        lines.extend(f"- {name}" for name in names)
+        lines.extend("- " + name for name in names)
     else:
         lines.append("- None detected")
 
-    lines.extend([
-        "",
-        f"Header OCR: {result.get('header_ocr', '').strip() or '[empty]'}",
-    ])
-
     if debug or not names:
-        row_lines = result.get("row_ocr_lines", [])
+        lines.append("")
+        lines.append("Header OCR: " + (result.get("header_ocr", "").strip() or "empty"))
         lines.append("")
         lines.append("Row OCR lines:")
+        row_lines = result.get("row_ocr_lines", [])
         if row_lines:
-            lines.extend(f"- {line}" for line in row_lines[:20])
+            lines.extend("- " + line for line in row_lines[:20])
         else:
-            lines.append("- [empty]")
+            lines.append("- empty")
 
     lines.extend([
         "",
-        f"Save: !confirm {scan_id}",
-        f"Save and replace that BG: !confirm {scan_id} replace",
-        f"Reject: !reject {scan_id}",
+        "Save: !confirm " + scan_id,
+        "Save and replace that BG: !confirm " + scan_id + " replace",
+        "Reject: !reject " + scan_id,
+        "Manual BG override while scanning: !scan bg2",
     ])
 
     return "```txt\n" + "\n".join(lines) + "\n```"
@@ -129,29 +137,32 @@ def format_scan_result(scan_id: str, result: dict[str, Any], debug: bool = False
 
 @bot.event
 async def on_ready() -> None:
-    print(f"Logged in as {bot.user} ({bot.user.id if bot.user else 'unknown id'})")
+    print("Logged in as " + str(bot.user))
 
 
 @bot.command(name="scan")
 async def scan(ctx: commands.Context, *args: str) -> None:
-    """Scan an attached/replied screenshot for battlegroup reservations."""
     if not scan_channel_allowed(ctx):
         await ctx.reply("Scans are restricted to the configured scan channel.", mention_author=False)
         return
 
     attachments = await get_scan_attachments(ctx)
     if not attachments:
-        await ctx.reply("Attach an image to `!scan`, or reply to an image with `!scan`.", mention_author=False)
+        await ctx.reply("Attach an image to !scan, or reply to an image with !scan.", mention_author=False)
         return
 
     debug = any(arg.lower() == "debug" for arg in args)
+    manual_bg = manual_bg_from_args(args)
 
     for attachment in attachments:
         try:
             image_bytes = await attachment.read()
-            result = await asyncio.to_thread(parse_battlegroup_screenshot, image_bytes)
+            async with OCR_LOCK:
+                result = await asyncio.to_thread(parse_battlegroup_screenshot, image_bytes)
+            if manual_bg is not None:
+                result["battlegroup"] = manual_bg
         except Exception as exc:
-            await ctx.reply(f"OCR failed: `{type(exc).__name__}: {exc}`", mention_author=False)
+            await ctx.reply("OCR failed: `" + type(exc).__name__ + ": " + str(exc) + "`", mention_author=False)
             continue
 
         scan_id = secrets.token_hex(3).upper()
@@ -163,14 +174,13 @@ async def scan(ctx: commands.Context, *args: str) -> None:
             "attachment": attachment.filename,
             "created_at": utc_now_iso(),
         }
-
         await ctx.send(format_scan_result(scan_id, result, debug=debug))
 
 
 @bot.command(name="confirm")
-async def confirm(ctx: commands.Context, scan_id: str | None = None, mode: str | None = None) -> None:
+async def confirm(ctx: commands.Context, scan_id: Optional[str] = None, mode: Optional[str] = None) -> None:
     if not scan_id:
-        await ctx.reply("Use `!confirm [scan_id]` or `!confirm [scan_id] replace`.", mention_author=False)
+        await ctx.reply("Use !confirm [scan_id] or !confirm [scan_id] replace.", mention_author=False)
         return
 
     scan_id = scan_id.upper()
@@ -184,7 +194,7 @@ async def confirm(ctx: commands.Context, scan_id: str | None = None, mode: str |
     names = result.get("reserved", [])
 
     if bg is None:
-        await ctx.reply("Cannot save: battlegroup was not detected.", mention_author=False)
+        await ctx.reply("Cannot save: battlegroup was not detected. Rescan with !scan bg2 if needed.", mention_author=False)
         return
 
     if not names:
@@ -203,19 +213,19 @@ async def confirm(ctx: commands.Context, scan_id: str | None = None, mode: str |
     del PENDING_SCANS[scan_id]
 
     action = "replaced" if replace else "saved"
-    await ctx.reply(f"BG{bg} reservations {action}: {', '.join(names)}", mention_author=False)
-    await log_action(ctx.guild, f"`{ctx.author}` confirmed scan `{scan_id}` for BG{bg}: {', '.join(names)}")
+    await ctx.reply("BG" + str(bg) + " reservations " + action + ": " + ", ".join(names), mention_author=False)
+    await log_action(ctx.guild, "`" + str(ctx.author) + "` confirmed scan `" + scan_id + "` for BG" + str(bg) + ": " + ", ".join(names))
 
 
 @bot.command(name="reject")
-async def reject(ctx: commands.Context, scan_id: str | None = None) -> None:
+async def reject(ctx: commands.Context, scan_id: Optional[str] = None) -> None:
     if not scan_id:
-        await ctx.reply("Use `!reject [scan_id]`.", mention_author=False)
+        await ctx.reply("Use !reject [scan_id].", mention_author=False)
         return
 
     scan_id = scan_id.upper()
     if PENDING_SCANS.pop(scan_id, None):
-        await ctx.reply(f"Rejected scan `{scan_id}`.", mention_author=False)
+        await ctx.reply("Rejected scan `" + scan_id + "`.", mention_author=False)
     else:
         await ctx.reply("No pending scan with that ID.", mention_author=False)
 
@@ -224,17 +234,16 @@ async def reject(ctx: commands.Context, scan_id: str | None = None) -> None:
 async def list_all(ctx: commands.Context) -> None:
     data = load_reservations()
     bgs = data.get("battlegroups", {})
-
     if not bgs:
         await ctx.reply("No reservations saved.", mention_author=False)
         return
 
-    lines: list[str] = []
+    lines = []
     for bg_key in sorted(bgs.keys(), key=lambda value: int(value) if value.isdigit() else value):
         names = bgs[bg_key].get("reserved", [])
-        lines.append(f"Battlegroup {bg_key}:")
+        lines.append("BG" + str(bg_key) + ":")
         if names:
-            lines.extend(f"- {name}" for name in names)
+            lines.extend("- " + name for name in names)
         else:
             lines.append("- None")
         lines.append("")
@@ -243,54 +252,57 @@ async def list_all(ctx: commands.Context) -> None:
 
 
 @bot.command(name="viewbg")
-async def view_bg(ctx: commands.Context, bg: str | None = None) -> None:
+async def view_bg(ctx: commands.Context, bg: Optional[str] = None) -> None:
     if not bg:
-        await ctx.reply("Use `!viewbg [number]`.", mention_author=False)
+        await ctx.reply("Use !viewbg [number].", mention_author=False)
         return
 
     data = load_reservations()
     bg_data = data.get("battlegroups", {}).get(str(bg))
     if not bg_data:
-        await ctx.reply(f"No saved reservations for BG{bg}.", mention_author=False)
+        await ctx.reply("No saved reservations for BG" + str(bg) + ".", mention_author=False)
         return
 
     names = bg_data.get("reserved", [])
-    lines = [f"Battlegroup {bg}:"]
-    lines.extend(f"- {name}" for name in names) if names else lines.append("- None")
+    lines = ["BG" + str(bg) + ":"]
+    if names:
+        lines.extend("- " + name for name in names)
+    else:
+        lines.append("- None")
     await ctx.send("```txt\n" + "\n".join(lines) + "\n```")
 
 
 @bot.command(name="rename")
-async def rename(ctx: commands.Context, old_name: str | None = None, *, new_name: str | None = None) -> None:
+async def rename(ctx: commands.Context, old_name: Optional[str] = None, *, new_name: Optional[str] = None) -> None:
     if not old_name or not new_name:
-        await ctx.reply("Use `!rename [old] [new]`. For names with spaces, quote the old name: `!rename \"old name\" new name`.", mention_author=False)
+        await ctx.reply("Use !rename [old] [new]. Quote names with spaces.", mention_author=False)
         return
 
     changed = rename_player(old_name, new_name)
-    await ctx.reply(f"Renamed {changed} matching entr{'y' if changed == 1 else 'ies'}.", mention_author=False)
-    await log_action(ctx.guild, f"`{ctx.author}` renamed `{old_name}` to `{new_name}`")
+    await ctx.reply("Renamed " + str(changed) + " matching entries.", mention_author=False)
+    await log_action(ctx.guild, "`" + str(ctx.author) + "` renamed `" + old_name + "` to `" + new_name + "`")
 
 
 @bot.command(name="clear")
-async def clear(ctx: commands.Context, *, player_name: str | None = None) -> None:
+async def clear(ctx: commands.Context, *, player_name: Optional[str] = None) -> None:
     if not player_name:
-        await ctx.reply("Use `!clear [player]`.", mention_author=False)
+        await ctx.reply("Use !clear [player].", mention_author=False)
         return
 
     removed = remove_player(player_name)
-    await ctx.reply(f"Removed {removed} matching entr{'y' if removed == 1 else 'ies'} for `{player_name}`.", mention_author=False)
-    await log_action(ctx.guild, f"`{ctx.author}` cleared `{player_name}`")
+    await ctx.reply("Removed " + str(removed) + " matching entries for `" + player_name + "`.", mention_author=False)
+    await log_action(ctx.guild, "`" + str(ctx.author) + "` cleared `" + player_name + "`")
 
 
 @bot.command(name="wipe")
-async def wipe(ctx: commands.Context, confirmation: str | None = None) -> None:
+async def wipe(ctx: commands.Context, confirmation: Optional[str] = None) -> None:
     if confirmation != "CONFIRM":
-        await ctx.reply("This clears all saved reservations. Use `!wipe CONFIRM`.", mention_author=False)
+        await ctx.reply("This clears all saved reservations. Use !wipe CONFIRM.", mention_author=False)
         return
 
     wipe_all()
     await ctx.reply("All saved reservations wiped.", mention_author=False)
-    await log_action(ctx.guild, f"`{ctx.author}` wiped all reservations")
+    await log_action(ctx.guild, "`" + str(ctx.author) + "` wiped all reservations")
 
 
 @bot.command(name="exportdata")
@@ -304,7 +316,7 @@ async def export_data(ctx: commands.Context) -> None:
 async def import_data(ctx: commands.Context) -> None:
     attachments = ctx.message.attachments
     if not attachments:
-        await ctx.reply("Attach a `reservations.json` file to `!importdata`.", mention_author=False)
+        await ctx.reply("Attach reservations.json to !importdata.", mention_author=False)
         return
 
     attachment = attachments[0]
@@ -316,18 +328,18 @@ async def import_data(ctx: commands.Context) -> None:
             raise ValueError("JSON must contain a battlegroups object.")
         save_reservations(data)
     except Exception as exc:
-        await ctx.reply(f"Import failed: `{type(exc).__name__}: {exc}`", mention_author=False)
+        await ctx.reply("Import failed: `" + type(exc).__name__ + ": " + str(exc) + "`", mention_author=False)
         return
 
     await ctx.reply("Imported reservations data.", mention_author=False)
-    await log_action(ctx.guild, f"`{ctx.author}` imported reservations data")
+    await log_action(ctx.guild, "`" + str(ctx.author) + "` imported reservations data")
 
 
 @bot.command(name="setscanchannel")
 @commands.has_permissions(manage_guild=True)
-async def set_scan_channel(ctx: commands.Context, channel_id: int | None = None) -> None:
+async def set_scan_channel(ctx: commands.Context, channel_id: Optional[int] = None) -> None:
     if channel_id is None:
-        await ctx.reply("Use `!setscanchannel [channel_id]`.", mention_author=False)
+        await ctx.reply("Use !setscanchannel [channel_id].", mention_author=False)
         return
 
     channel = ctx.guild.get_channel(channel_id) if ctx.guild else None
@@ -338,14 +350,14 @@ async def set_scan_channel(ctx: commands.Context, channel_id: int | None = None)
     config = load_config()
     config["scan_channel_id"] = channel_id
     save_config(config)
-    await ctx.reply(f"Scan channel set to {channel.mention}.", mention_author=False)
+    await ctx.reply("Scan channel set to " + channel.mention + ".", mention_author=False)
 
 
 @bot.command(name="setlogchannel")
 @commands.has_permissions(manage_guild=True)
-async def set_log_channel(ctx: commands.Context, channel_id: int | None = None) -> None:
+async def set_log_channel(ctx: commands.Context, channel_id: Optional[int] = None) -> None:
     if channel_id is None:
-        await ctx.reply("Use `!setlogchannel [channel_id]`.", mention_author=False)
+        await ctx.reply("Use !setlogchannel [channel_id].", mention_author=False)
         return
 
     channel = ctx.guild.get_channel(channel_id) if ctx.guild else None
@@ -356,7 +368,7 @@ async def set_log_channel(ctx: commands.Context, channel_id: int | None = None) 
     config = load_config()
     config["log_channel_id"] = channel_id
     save_config(config)
-    await ctx.reply(f"Log channel set to {channel.mention}.", mention_author=False)
+    await ctx.reply("Log channel set to " + channel.mention + ".", mention_author=False)
 
 
 @bot.command(name="clearscanchannel")
@@ -376,6 +388,7 @@ async def help_cmd(ctx: commands.Context) -> None:
         "Scanning:\n"
         "!scan                 Scan an attached image\n"
         "!scan debug           Scan and show row OCR lines\n"
+        "!scan bg2             Scan and force BG2 if header OCR fails\n"
         "!confirm [id]         Save detected reservations\n"
         "!confirm [id] replace Save and replace that battlegroup\n"
         "!reject [id]          Discard pending scan\n\n"
@@ -413,7 +426,7 @@ async def command_error(ctx: commands.Context, error: commands.CommandError) -> 
     if isinstance(error, commands.MissingPermissions):
         await ctx.reply("You do not have permission to use that command.", mention_author=False)
         return
-    await ctx.reply(f"Command error: `{type(error).__name__}: {error}`", mention_author=False)
+    await ctx.reply("Command error: `" + type(error).__name__ + ": " + str(error) + "`", mention_author=False)
 
 
 bot.run(TOKEN)

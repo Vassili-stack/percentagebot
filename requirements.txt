@@ -1,5 +1,2 @@
 py-cord==2.6.1
-pytesseract
 pillow
-opencv-python-headless
-numpy
