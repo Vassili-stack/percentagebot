@@ -1,6 +1,5 @@
 py-cord==2.6.1
-easyocr
-opencv-python-headless
+pytesseract
 pillow
+opencv-python-headless
 numpy
-python-dotenv
