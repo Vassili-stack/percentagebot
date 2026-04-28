@@ -1,81 +1,59 @@
-# PercentageBot OCR rebuild
+# Percentagebot OCR reservation rebuild
 
-This rebuild only tracks reserved players by battlegroup.
+This build is focused on one job: scanning MCOC battlegroup screenshots and saving the players marked RESERVED.
 
-## Runtime model
-
-The bot uses:
-
-- py-cord for Discord
-- Pillow for cropping and preprocessing
-- the system Tesseract binary through subprocess
-
-It does not use EasyOCR, OpenCV, NumPy, or pytesseract. This keeps memory lower on Fly.
-
-## Fly setup
-
-Set the token:
+## Deploy
 
 ```bash
-fly secrets set DISCORD_TOKEN="YOUR_TOKEN" -a percentagebot
-```
-
-Deploy:
-
-```bash
+fly secrets set DISCORD_TOKEN="your_token_here" -a percentagebot
 fly deploy -a percentagebot
 ```
 
-The included `fly.toml` sets the machine to 512 MB shared CPU.
+The Fly machine target is 512 MB.
 
-## Discord command flow
+## Best scan command
 
-Recommended scan command:
-
-```txt
-!scan bg2 debug
-```
-
-Once the output looks correct:
-
-```txt
-!confirm SCANID
-```
-
-To replace the saved names for that battlegroup:
-
-```txt
-!confirm SCANID replace
-```
-
-## Commands
+Use manual battlegroup override when possible:
 
 ```txt
 !scan bg2
 !scan bg2 debug
-!confirm SCANID
-!confirm SCANID replace
-!reject SCANID
-!list
-!viewbg 2
-!rename "Old Name" "New Name"
-!clear "Player Name"
-!clearbg 2
-!wipe confirm
-!exportdata
-!importdata
-!setscanchannel CHANNEL_ID
-!setlogchannel CHANNEL_ID
-!config
 ```
 
-## Notes
+Manual BG avoids wasting OCR work on the header.
 
-Use the manual battlegroup argument, such as `bg1`, `bg2`, or `bg3`. It avoids wasting OCR memory on the header and is more reliable.
+## Confirming
 
-The bot searches for an image in this order:
+```txt
+!confirm SCANID
+!confirm SCANID replace
+!confirm SCANID bg2 replace
+```
 
-1. Attachment on the command message
-2. Attachment on the replied-to message
-3. Most recent image in the last 10 channel messages
+## Fixing a pending scan before saving
 
+```txt
+!editscan SCANID bg2 "bos rocker" "Whec" "Silent.Slayer" "Vazwya"
+!showscan SCANID
+```
+
+## Data
+
+Saved file:
+
+```txt
+/data/reservations.json
+```
+
+Commands:
+
+```txt
+!list
+!viewbg 2
+!clearbg 2
+!clear "Player Name"
+!rename "Old Name" "New Name"
+!exportdata
+!importdata
+!wipe confirm
+```

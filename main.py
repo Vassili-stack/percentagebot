@@ -62,6 +62,10 @@ async def on_message(message: discord.Message):
             await cmd_confirm(message, args_text)
         elif command == "reject":
             await cmd_reject(message, args_text)
+        elif command == "editscan":
+            await cmd_editscan(message, args_text)
+        elif command == "showscan":
+            await cmd_showscan(message, args_text)
         elif command == "list":
             await cmd_list(message)
         elif command == "viewbg":
@@ -223,12 +227,17 @@ async def cmd_confirm(message: discord.Message, args_text: str):
 
     scan_id = parts[0].upper()
     replace = any(part.lower() == "replace" for part in parts[1:])
+    bg_override = None
+    for part in parts[1:]:
+        maybe = parse_single_bg(part)
+        if maybe is not None:
+            bg_override = maybe
     scan = pending_scans.get(scan_id)
     if not scan:
         await message.reply("That scan ID is not pending.")
         return
 
-    bg = scan.get("battlegroup")
+    bg = bg_override if bg_override is not None else scan.get("battlegroup")
     names = scan.get("reserved_names") or []
     if bg is None:
         await message.reply("Battlegroup was not detected. Re-scan with something like !scan bg2.")
@@ -254,6 +263,82 @@ async def cmd_reject(message: discord.Message, args_text: str):
         await message.reply(f"Rejected scan {scan_id}.")
     else:
         await message.reply("That scan ID is not pending.")
+
+
+async def cmd_editscan(message: discord.Message, args_text: str):
+    try:
+        parts = shlex.split(args_text)
+    except ValueError:
+        await message.reply('Use: !editscan SCANID bg2 "Name One" "Name Two"')
+        return
+
+    if len(parts) < 2:
+        await message.reply('Use: !editscan SCANID bg2 "Name One" "Name Two"')
+        return
+
+    scan_id = parts[0].upper()
+    scan = pending_scans.get(scan_id)
+    if not scan:
+        await message.reply("That scan ID is not pending.")
+        return
+
+    bg = None
+    names = []
+    for part in parts[1:]:
+        maybe_bg = parse_single_bg(part)
+        if maybe_bg is not None:
+            bg = maybe_bg
+        else:
+            cleaned = part.strip().strip('"')
+            if cleaned:
+                names.append(cleaned)
+
+    if bg is not None:
+        scan["battlegroup"] = bg
+    if names:
+        scan["reserved_names"] = unique_keep_order_local(names)
+
+    pending_scans[scan_id] = scan
+    await send_code(message.channel, format_pending_scan(scan_id, scan))
+
+
+async def cmd_showscan(message: discord.Message, args_text: str):
+    scan_id = args_text.strip().upper()
+    if not scan_id:
+        await message.reply("Use: !showscan SCANID")
+        return
+    scan = pending_scans.get(scan_id)
+    if not scan:
+        await message.reply("That scan ID is not pending.")
+        return
+    await send_code(message.channel, format_pending_scan(scan_id, scan))
+
+
+def format_pending_scan(scan_id: str, scan: dict) -> str:
+    bg = scan.get("battlegroup") if scan.get("battlegroup") is not None else "not set"
+    names = scan.get("reserved_names") or []
+    lines = [f"Pending scan: {scan_id}", f"Battlegroup: {bg}", "", "Reserved names:"]
+    if names:
+        lines.extend(f"- {name}" for name in names)
+    else:
+        lines.append("- none")
+    lines.extend(["", f"Confirm: {PREFIX}confirm {scan_id}", f"Edit: {PREFIX}editscan {scan_id} bg2 \"Name One\" \"Name Two\""])
+    return "\n".join(lines)
+
+
+def unique_keep_order_local(values: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for value in values:
+        value = value.strip()
+        if not value:
+            continue
+        key = value.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return out
 
 
 async def cmd_list(message: discord.Message):
@@ -423,7 +508,10 @@ OCR commands
 !scan bg2
 !scan bg2 debug
 !confirm SCANID
+!confirm SCANID bg2
 !confirm SCANID replace
+!editscan SCANID bg2 "Name One" "Name Two"
+!showscan SCANID
 !reject SCANID
 
 Viewing
