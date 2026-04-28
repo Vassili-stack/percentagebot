@@ -1,0 +1,22 @@
+app = "percentagebot"
+primary_region = "sea"
+
+[build]
+
+[processes]
+bot = "python main.py"
+
+[http_service]
+internal_port = 8080
+auto_stop_machines = false
+auto_start_machines = true
+processes = ["bot"]
+
+[mounts]
+source = "datavol"
+destination = "/data"
+
+[[vm]]
+memory = "256mb"
+cpu_kind = "shared"
+cpus = 1
